@@ -5,7 +5,7 @@
  */
 
 import type { BadgeTone } from '@/components/ui/badge';
-import type { ApiCargo, ApiTruck, MatchCategory, UserRole } from '@/lib/api';
+import type { ApiCargo, ApiTruck, BookingStatus, MatchCategory, UserRole } from '@/lib/api';
 
 export type TruckStatus = ApiTruck['status'];
 export type CargoStatus = ApiCargo['status'];
@@ -35,12 +35,36 @@ export const MATCH_CATEGORY_TONE: Record<MatchCategory, BadgeTone> = {
   poor: 'neutral',
 };
 
+export const BOOKING_STATUS_TONE: Record<BookingStatus, BadgeTone> = {
+  pending: 'warning',
+  accepted: 'success',
+  rejected: 'neutral',
+  cancelled: 'danger',
+};
+
+export const BOOKING_STATUSES: BookingStatus[] = [
+  'pending',
+  'accepted',
+  'rejected',
+  'cancelled',
+];
+
 export const TRUCK_STATUSES: TruckStatus[] = [
   'available',
   'booked',
   'in_transit',
   'maintenance',
   'inactive',
+];
+
+export const CARGO_STATUSES: CargoStatus[] = [
+  'posted',
+  'matched',
+  'booked',
+  'in_transit',
+  'delivered',
+  'completed',
+  'cancelled',
 ];
 
 /** The truck body types the SRS calls out most often. Free text is allowed. */
@@ -64,6 +88,9 @@ export const CARGO_TYPES = [
   'Machinery',
 ];
 
+/** Currencies the marketplace quotes prices in. Free text is allowed server-side. */
+export const CURRENCIES = ['TZS', 'USD', 'KES', 'UGX', 'RWF'];
+
 /** 'in_transit' → 'In transit' */
 export function titleCaseStatus(status: string): string {
   const words = status.replace(/_/g, ' ');
@@ -86,6 +113,46 @@ export function roleLabel(role: UserRole | null | undefined): string {
 export function formatTons(tons: number): string {
   const rounded = Math.round(tons * 10) / 10;
   return `${rounded} t`;
+}
+
+/**
+ * Formats a money amount with its ISO code, e.g. 45000 + 'TZS' → 'TZS 45,000'.
+ * Falls back to a plain number string for unknown currency codes.
+ */
+export function formatMoney(amount: number | null | undefined, currency = 'TZS'): string {
+  if (amount === null || amount === undefined) return '';
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: 'currency',
+      currency,
+      maximumFractionDigits: 0,
+    }).format(amount);
+  } catch {
+    return `${currency} ${Math.round(amount).toLocaleString()}`;
+  }
+}
+
+/** Rate per ton → 'TZS 45,000 / t'. Empty when no rate is set. */
+export function formatRate(rate: number | null | undefined, currency = 'TZS'): string {
+  if (rate === null || rate === undefined) return '';
+  return `${formatMoney(rate, currency)} / t`;
+}
+
+/**
+ * Price for a haul: the truck rate × cargo weight when both are known, else
+ * the load's own budget. Mirrors the backend's estimate so the request dialog
+ * can pre-fill a sensible number.
+ */
+export function estimateCost(truck: ApiTruck, cargo: ApiCargo): number | null {
+  if (truck.ratePerTon != null && cargo.weightTons > 0) {
+    return Math.round(truck.ratePerTon * cargo.weightTons);
+  }
+  return cargo.budget ?? null;
+}
+
+/** The ISO code money for a truck↔cargo pair should be quoted in. */
+export function pairCurrency(cargo: ApiCargo): string {
+  return cargo.currency || 'TZS';
 }
 
 /** Epoch ms → '7 Oct 2026'. Returns '' when the value is missing. */

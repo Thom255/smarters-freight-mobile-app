@@ -1,7 +1,8 @@
 import { router, type Href } from 'expo-router';
-import { useState } from 'react';
-import { Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useMemo, useState } from 'react';
+import { Alert, Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
+import { ListControls, matchesQuery } from '@/components/list-controls';
 import {
   Badge,
   Button,
@@ -18,25 +19,80 @@ import { useTheme } from '@/hooks/use-theme';
 import { useCargo, useCreateCargo, useUpdateCargo } from '@/hooks/use-cargo';
 import type { ApiCargo } from '@/lib/api';
 import {
+  CARGO_STATUSES,
   CARGO_STATUS_TONE,
   CARGO_TYPES,
+  CURRENCIES,
   formatDate,
+  formatMoney,
   formatTons,
   titleCaseStatus,
 } from '@/lib/marketplace';
+
+const STATUS_FILTERS = CARGO_STATUSES.map((value) => ({
+  value,
+  label: titleCaseStatus(value),
+}));
 
 export default function CargoScreen() {
   const theme = useTheme();
   const { cargo, loading, refreshing, error, reload } = useCargo();
   const { updateCargo } = useUpdateCargo();
   const [composerOpen, setComposerOpen] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [query, setQuery] = useState('');
+  const [status, setStatus] = useState<(typeof STATUS_FILTERS)[number]['value'] | 'all'>('all');
 
-  const count = cargo?.length ?? 0;
-  const subtitle = count > 0 ? `${count} load${count === 1 ? '' : 's'} posted` : undefined;
+  const filtered = useMemo(
+    () =>
+      (cargo ?? []).filter(
+        (load) =>
+          (status === 'all' || load.status === status) &&
+          matchesQuery(
+            query,
+            load.reference,
+            load.cargoType,
+            load.pickupLocation,
+            load.destination,
+            load.matchedTruck?.registrationNumber,
+          ),
+      ),
+    [cargo, query, status],
+  );
+  const filtering = query.trim() !== '' || status !== 'all';
 
-  const cancel = async (load: ApiCargo) => {
-    await updateCargo(load.id, { status: 'cancelled' });
-    void reload();
+  const totalCount = cargo?.length ?? 0;
+  const count = filtered.length;
+  const subtitle =
+    totalCount > 0
+      ? filtering
+        ? `${count} of ${totalCount} load${totalCount === 1 ? '' : 's'}`
+        : `${totalCount} load${totalCount === 1 ? '' : 's'} posted`
+      : undefined;
+
+  const cancel = (load: ApiCargo) => {
+    Alert.alert(
+      'Cancel this load?',
+      `${load.reference} will be marked cancelled and stop being matched to trucks.`,
+      [
+        { text: 'Keep it', style: 'cancel' },
+        {
+          text: 'Cancel load',
+          style: 'destructive',
+          onPress: () => {
+            void (async () => {
+              setActionError(null);
+              const result = await updateCargo(load.id, { status: 'cancelled' });
+              if (result.ok) {
+                await reload();
+              } else {
+                setActionError(result.message);
+              }
+            })();
+          },
+        },
+      ],
+    );
   };
 
   return (
@@ -49,11 +105,26 @@ export default function CargoScreen() {
       <Header title="My cargo" subtitle={subtitle} back={false} />
 
       <View style={styles.body}>
+        {actionError ? (
+          <Text style={[theme.typography.caption, { color: theme.danger }]}>{actionError}</Text>
+        ) : null}
         <Button
           onPress={() => setComposerOpen(true)}
           iconLeft={<Icon name="plus" size={18} color={theme.onPrimary} />}>
           Post cargo
         </Button>
+
+        {!loading && totalCount > 0 ? (
+          <ListControls
+            query={query}
+            onQueryChange={setQuery}
+            placeholder="Search reference, type or route"
+            options={STATUS_FILTERS}
+            active={status}
+            onActiveChange={setStatus}
+            allLabel="All statuses"
+          />
+        ) : null}
 
         {error && !cargo ? (
           <Card>
@@ -74,7 +145,7 @@ export default function CargoScreen() {
           </Card>
         ) : loading && !cargo ? (
           <SkeletonList count={3} />
-        ) : count === 0 ? (
+        ) : totalCount === 0 ? (
           <Card>
             <View style={styles.emptyState}>
               <View style={[styles.emptyIcon, { backgroundColor: theme.primarySubtle }]}>
@@ -95,8 +166,31 @@ export default function CargoScreen() {
               </Button>
             </View>
           </Card>
+        ) : count === 0 ? (
+          <Card>
+            <View style={styles.emptyState}>
+              <View style={[styles.emptyIcon, { backgroundColor: theme.backgroundSelected }]}>
+                <Icon name="search" size={26} color={theme.textSecondary} />
+              </View>
+              <Text style={[theme.typography.subheading, { color: theme.text }]}>
+                No loads match
+              </Text>
+              <Text style={[theme.typography.caption, styles.emptyText, { color: theme.textSecondary }]}>
+                Nothing here matches your search or status filter.
+              </Text>
+              <Button
+                fullWidth={false}
+                variant="outline"
+                onPress={() => {
+                  setQuery('');
+                  setStatus('all');
+                }}>
+                Clear filters
+              </Button>
+            </View>
+          </Card>
         ) : (
-          cargo?.map((load, index) => (
+          filtered.map((load, index) => (
             <FadeInView key={load.id} index={index}>
               <Card>
                 <View style={styles.row}>
@@ -111,6 +205,11 @@ export default function CargoScreen() {
                       {load.reference} · {load.cargoType} · {formatTons(load.weightTons)}
                       {formatDate(load.pickupDate) ? ` · ${formatDate(load.pickupDate)}` : ''}
                     </Text>
+                    {load.budget != null ? (
+                      <Text style={[theme.typography.caption, { color: theme.textSecondary }]} numberOfLines={1}>
+                        Budget {formatMoney(load.budget, load.currency)}
+                      </Text>
+                    ) : null}
                     {load.matchedTruck ? (
                       <Text style={[theme.typography.caption, { color: theme.primary }]} numberOfLines={1}>
                         Booked with {load.matchedTruck.truckType} · {load.matchedTruck.registrationNumber}
@@ -136,7 +235,7 @@ export default function CargoScreen() {
                       variant="ghost"
                       size="sm"
                       fullWidth={false}
-                      onPress={() => void cancel(load)}
+                      onPress={() => cancel(load)}
                       iconLeft={<Icon name="error" size={16} color={theme.danger} />}>
                       Cancel
                     </Button>
@@ -185,6 +284,7 @@ function CargoComposer({
   const [destination, setDestination] = useState('');
   const [pickupDate, setPickupDate] = useState(todayISODate());
   const [budget, setBudget] = useState('');
+  const [currency, setCurrency] = useState(CURRENCIES[0]);
   const [notes, setNotes] = useState('');
   const [errors, setErrors] = useState<Record<string, string | undefined>>({});
 
@@ -203,6 +303,7 @@ function CargoComposer({
       destination,
       pickupDate,
       budget: Number.isFinite(parsedBudget) ? parsedBudget : undefined,
+      currency,
       specialRequirements: notes,
     });
 
@@ -217,6 +318,7 @@ function CargoComposer({
     setDestination('');
     setPickupDate(todayISODate());
     setBudget('');
+    setCurrency(CURRENCIES[0]);
     setNotes('');
     onCreated();
   };
@@ -325,6 +427,33 @@ function CargoComposer({
               keyboardType="number-pad"
               returnKeyType="next"
             />
+
+            <View style={styles.field}>
+              <Text style={[theme.typography.label, { color: theme.text }]}>Currency</Text>
+              <View style={styles.chips}>
+                {CURRENCIES.map((code) => {
+                  const selected = code === currency;
+                  return (
+                    <Pressable
+                      key={code}
+                      onPress={() => setCurrency(code)}
+                      accessibilityRole="button"
+                      style={[
+                        styles.chip,
+                        { backgroundColor: selected ? theme.primary : theme.backgroundSelected },
+                      ]}>
+                      <Text
+                        style={[
+                          theme.typography.caption,
+                          { color: selected ? theme.onPrimary : theme.text },
+                        ]}>
+                        {code}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            </View>
 
             <Input
               label="Special requirements (optional)"

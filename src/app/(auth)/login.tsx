@@ -104,7 +104,10 @@ export default function LoginScreen() {
                 onSubmitEditing={submit}
               />
 
-              <Pressable style={styles.forgot} hitSlop={Spacing.two}>
+              <Pressable
+                style={styles.forgot}
+                hitSlop={Spacing.two}
+                onPress={() => router.push('/forgot-password')}>
                 <Text style={[theme.typography.label, { color: theme.primary }]}>
                   Forgot password?
                 </Text>

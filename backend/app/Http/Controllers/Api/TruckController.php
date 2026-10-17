@@ -25,8 +25,7 @@ class TruckController extends Controller
     public function __construct(
         private SupabaseClient $supabase,
         private BookingService $bookings,
-    ) {
-    }
+    ) {}
 
     public function index(Request $request): JsonResponse
     {
@@ -57,6 +56,9 @@ class TruckController extends Controller
             'capacityTons' => ['required', 'numeric', 'gt:0', 'max:1000'],
             'currentLocation' => ['required', 'string', 'min:2', 'max:150'],
             'availabilityDate' => ['required', 'date'],
+            'driverName' => ['nullable', 'string', 'max:120'],
+            'driverPhone' => ['nullable', 'string', 'max:40'],
+            'ratePerTon' => ['nullable', 'numeric', 'min:0', 'max:1000000000'],
         ], [
             'registrationNumber.required' => 'Enter the truck registration number',
             'truckType.required' => 'Enter the truck type',
@@ -75,17 +77,43 @@ class TruckController extends Controller
 
         $userId = (string) $request->attributes->get('auth_user')['id'];
 
-        $truck = $this->supabase->insert('trucks', [
-            'owner_id' => $userId,
-            'registration_number' => trim($data['registrationNumber']),
-            'truck_type' => trim($data['truckType']),
-            'capacity_tons' => (float) $data['capacityTons'],
-            'current_location' => trim($data['currentLocation']),
-            'availability_date' => $this->dateOnly($data['availabilityDate']),
-            'status' => 'available',
-        ]);
+        try {
+            $truck = $this->supabase->insert('trucks', [
+                'owner_id' => $userId,
+                'registration_number' => trim($data['registrationNumber']),
+                'truck_type' => trim($data['truckType']),
+                'capacity_tons' => (float) $data['capacityTons'],
+                'current_location' => trim($data['currentLocation']),
+                'availability_date' => $this->dateOnly($data['availabilityDate']),
+                'driver_name' => $this->nullable($data['driverName'] ?? null),
+                'driver_phone' => $this->nullable($data['driverPhone'] ?? null),
+                'rate_per_ton' => isset($data['ratePerTon']) && $data['ratePerTon'] !== null ? (float) $data['ratePerTon'] : null,
+                'status' => 'available',
+            ]);
+        } catch (\RuntimeException $e) {
+            // trucks_registration_unique (case-insensitive) — plate already in
+            // use, either by this owner or by someone else. Surface it as a
+            // field error instead of a 500.
+            if (str_contains($e->getMessage(), '23505') || str_contains($e->getMessage(), 'duplicate key')) {
+                return $this->fieldError(
+                    'registrationNumber',
+                    'That registration number is already registered'
+                );
+            }
+
+            throw $e;
+        }
 
         return response()->json(['ok' => true, 'truck' => FreightPresenter::truck($truck)], 201);
+    }
+
+    private function fieldError(string $field, string $message): JsonResponse
+    {
+        return response()->json([
+            'ok' => false,
+            'field' => $field,
+            'message' => $message,
+        ], 422);
     }
 
     public function show(Request $request, string $id): JsonResponse
@@ -116,6 +144,9 @@ class TruckController extends Controller
             'status' => ['sometimes', 'string', 'in:available,booked,in_transit,maintenance,inactive'],
             'currentLocation' => ['sometimes', 'string', 'min:2', 'max:150'],
             'availabilityDate' => ['sometimes', 'date'],
+            'driverName' => ['sometimes', 'nullable', 'string', 'max:120'],
+            'driverPhone' => ['sometimes', 'nullable', 'string', 'max:40'],
+            'ratePerTon' => ['sometimes', 'nullable', 'numeric', 'min:0', 'max:1000000000'],
         ]);
 
         $values = [];
@@ -127,6 +158,15 @@ class TruckController extends Controller
         }
         if (array_key_exists('availabilityDate', $data)) {
             $values['availability_date'] = $this->dateOnly($data['availabilityDate']);
+        }
+        if (array_key_exists('driverName', $data)) {
+            $values['driver_name'] = $this->nullable($data['driverName']);
+        }
+        if (array_key_exists('driverPhone', $data)) {
+            $values['driver_phone'] = $this->nullable($data['driverPhone']);
+        }
+        if (array_key_exists('ratePerTon', $data)) {
+            $values['rate_per_ton'] = $data['ratePerTon'] === null ? null : (float) $data['ratePerTon'];
         }
 
         if ($values === []) {
@@ -162,6 +202,10 @@ class TruckController extends Controller
     /** @return array<string, mixed>|null */
     private function findOwned(Request $request, string $id): ?array
     {
+        if (! $this->looksLikeId($id)) {
+            return null;
+        }
+
         $userId = (string) $request->attributes->get('auth_user')['id'];
 
         return $this->supabase->selectOne('trucks', [
@@ -182,5 +226,12 @@ class TruckController extends Controller
     private function dateOnly(string $value): string
     {
         return substr(trim($value), 0, 10);
+    }
+
+    private function nullable(?string $value): ?string
+    {
+        $value = trim((string) $value);
+
+        return $value === '' ? null : $value;
     }
 }

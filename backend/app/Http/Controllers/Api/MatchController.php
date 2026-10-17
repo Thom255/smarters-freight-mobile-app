@@ -3,7 +3,6 @@
 namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
-use App\Services\BookingService;
 use App\Services\FreightPresenter;
 use App\Services\MatchingEngine;
 use App\Services\SupabaseClient;
@@ -11,16 +10,16 @@ use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 
 /**
- * Matching engine endpoints (SRS §18–§22).
+ * Matching engine endpoints (SRS §18–§21).
  *
  *   GET  /api/matches                → role-aware best matches for the caller
  *                                      truck owner → their trucks × posted cargo
  *                                      cargo owner → their cargo × available trucks
  *   GET  /api/matches/cargo/{id}     → available trucks for one of my loads
  *   GET  /api/matches/truck/{id}     → posted loads for one of my trucks
- *   POST /api/matches/accept         → book a truck↔cargo match (both sides)
  *
  * Matches are scored on the fly (stateless) so results are never stale.
+ * Booking a match is a separate request lifecycle under /api/bookings.
  */
 class MatchController extends Controller
 {
@@ -29,41 +28,7 @@ class MatchController extends Controller
     public function __construct(
         private SupabaseClient $supabase,
         private MatchingEngine $engine,
-        private BookingService $bookings,
-    ) {
-    }
-
-    /** Book a match: reserve the truck and mark the load booked. */
-    public function accept(Request $request): JsonResponse
-    {
-        $data = $request->validate([
-            'truckId' => ['required', 'string', 'max:64'],
-            'cargoId' => ['required', 'string', 'max:64'],
-        ], [
-            'truckId.required' => 'Missing the truck to book',
-            'cargoId.required' => 'Missing the load to book',
-        ], [
-            'truckId' => 'truck',
-            'cargoId' => 'cargo',
-        ]);
-
-        $userId = (string) $request->attributes->get('auth_user')['id'];
-        $result = $this->bookings->accept($userId, $data['truckId'], $data['cargoId']);
-
-        if (($result['ok'] ?? false) !== true) {
-            return response()->json([
-                'ok' => false,
-                'field' => $result['field'],
-                'message' => $result['message'],
-            ], $result['status']);
-        }
-
-        return response()->json([
-            'ok' => true,
-            'truck' => FreightPresenter::truck($result['truck']),
-            'cargo' => FreightPresenter::cargo($result['cargo']),
-        ]);
-    }
+    ) {}
 
     public function index(Request $request): JsonResponse
     {
@@ -87,50 +52,66 @@ class MatchController extends Controller
 
     public function forCargo(Request $request, string $id): JsonResponse
     {
-        $userId = (string) $request->attributes->get('auth_user')['id'];
-
-        $cargo = $this->supabase->selectOne('cargo', [
-            'id' => "eq.{$id}",
-            'owner_id' => "eq.{$userId}",
-        ]);
-
-        if ($cargo === null) {
-            return response()->json(['ok' => false, 'field' => 'cargo', 'message' => 'Cargo not found'], 404);
+        if (! $this->looksLikeId($id)) {
+            return $this->cargoNotFound();
         }
 
-        $trucks = $this->availableTrucks();
+        $userId = (string) $request->attributes->get('auth_user')['id'];
+
+        // The ownership check and the candidate-truck pool go out together —
+        // one concurrent batch instead of two serial round trips.
+        $rows = $this->supabase->selectMany([
+            'cargo' => [
+                'table' => 'cargo',
+                'query' => ['id' => "eq.{$id}", 'owner_id' => "eq.{$userId}"],
+            ],
+            'trucks' => ['table' => 'trucks', 'query' => $this->availableTruckQuery()],
+        ]);
+
+        $cargo = $rows['cargo'][0] ?? null;
+
+        if ($cargo === null) {
+            return $this->cargoNotFound();
+        }
 
         return response()->json([
             'ok' => true,
             'cargo' => FreightPresenter::cargo($cargo),
             'matches' => array_map(
                 fn (array $match) => FreightPresenter::match($match),
-                $this->engine->matchCargo($cargo, $trucks),
+                $this->engine->matchCargo($cargo, $rows['trucks'] ?? []),
             ),
         ]);
     }
 
     public function forTruck(Request $request, string $id): JsonResponse
     {
-        $userId = (string) $request->attributes->get('auth_user')['id'];
-
-        $truck = $this->supabase->selectOne('trucks', [
-            'id' => "eq.{$id}",
-            'owner_id' => "eq.{$userId}",
-        ]);
-
-        if ($truck === null) {
-            return response()->json(['ok' => false, 'field' => 'truck', 'message' => 'Truck not found'], 404);
+        if (! $this->looksLikeId($id)) {
+            return $this->truckNotFound();
         }
 
-        $cargo = $this->postedCargo();
+        $userId = (string) $request->attributes->get('auth_user')['id'];
+
+        $rows = $this->supabase->selectMany([
+            'truck' => [
+                'table' => 'trucks',
+                'query' => ['id' => "eq.{$id}", 'owner_id' => "eq.{$userId}"],
+            ],
+            'cargo' => ['table' => 'cargo', 'query' => $this->postedCargoQuery()],
+        ]);
+
+        $truck = $rows['truck'][0] ?? null;
+
+        if ($truck === null) {
+            return $this->truckNotFound();
+        }
 
         return response()->json([
             'ok' => true,
             'truck' => FreightPresenter::truck($truck),
             'matches' => array_map(
                 fn (array $match) => FreightPresenter::match($match),
-                $this->engine->matchTruck($truck, $cargo),
+                $this->engine->matchTruck($truck, $rows['cargo'] ?? []),
             ),
         ]);
     }
@@ -138,16 +119,21 @@ class MatchController extends Controller
     /** @return array<int, array<string, mixed>> */
     private function matchesForFleet(string $userId): array
     {
-        $trucks = $this->supabase->select('trucks', [
-            'owner_id' => "eq.{$userId}",
-            'status' => 'eq.available',
-            'order' => 'created_at.desc',
+        $rows = $this->supabase->selectMany([
+            'trucks' => [
+                'table' => 'trucks',
+                'query' => [
+                    'owner_id' => "eq.{$userId}",
+                    'status' => 'eq.available',
+                    'order' => 'created_at.desc',
+                ],
+            ],
+            'cargo' => ['table' => 'cargo', 'query' => $this->postedCargoQuery()],
         ]);
-        $cargo = $this->postedCargo();
 
         $matches = [];
-        foreach ($trucks as $truck) {
-            foreach ($this->engine->matchTruck($truck, $cargo) as $match) {
+        foreach ($rows['trucks'] as $truck) {
+            foreach ($this->engine->matchTruck($truck, $rows['cargo']) as $match) {
                 $matches[] = $match;
             }
         }
@@ -158,16 +144,21 @@ class MatchController extends Controller
     /** @return array<int, array<string, mixed>> */
     private function matchesForLoads(string $userId): array
     {
-        $cargo = $this->supabase->select('cargo', [
-            'owner_id' => "eq.{$userId}",
-            'status' => 'eq.posted',
-            'order' => 'created_at.desc',
+        $rows = $this->supabase->selectMany([
+            'cargo' => [
+                'table' => 'cargo',
+                'query' => [
+                    'owner_id' => "eq.{$userId}",
+                    'status' => 'eq.posted',
+                    'order' => 'created_at.desc',
+                ],
+            ],
+            'trucks' => ['table' => 'trucks', 'query' => $this->availableTruckQuery()],
         ]);
-        $trucks = $this->availableTrucks();
 
         $matches = [];
-        foreach ($cargo as $load) {
-            foreach ($this->engine->matchCargo($load, $trucks) as $match) {
+        foreach ($rows['cargo'] as $load) {
+            foreach ($this->engine->matchCargo($load, $rows['trucks']) as $match) {
                 $matches[] = $match;
             }
         }
@@ -175,24 +166,24 @@ class MatchController extends Controller
         return $matches;
     }
 
-    /** @return array<int, array<string, mixed>> */
-    private function availableTrucks(): array
+    /** @return array<string, string> */
+    private function availableTruckQuery(): array
     {
-        return $this->supabase->select('trucks', [
+        return [
             'status' => 'eq.available',
             'order' => 'created_at.desc',
             'limit' => 500,
-        ]);
+        ];
     }
 
-    /** @return array<int, array<string, mixed>> */
-    private function postedCargo(): array
+    /** @return array<string, string> */
+    private function postedCargoQuery(): array
     {
-        return $this->supabase->select('cargo', [
+        return [
             'status' => 'eq.posted',
             'order' => 'pickup_date.asc',
             'limit' => 500,
-        ]);
+        ];
     }
 
     /**
@@ -206,5 +197,23 @@ class MatchController extends Controller
         });
 
         return $matches;
+    }
+
+    private function cargoNotFound(): JsonResponse
+    {
+        return response()->json([
+            'ok' => false,
+            'field' => 'cargo',
+            'message' => 'Cargo not found',
+        ], 404);
+    }
+
+    private function truckNotFound(): JsonResponse
+    {
+        return response()->json([
+            'ok' => false,
+            'field' => 'truck',
+            'message' => 'Truck not found',
+        ], 404);
     }
 }

@@ -16,6 +16,9 @@ export type NewTruckInput = {
   currentLocation: string;
   /** 'YYYY-MM-DD' */
   availabilityDate: string;
+  driverName?: string;
+  driverPhone?: string;
+  ratePerTon?: number;
 };
 
 export type TruckActionResult =
@@ -118,6 +121,9 @@ export function useCreateTruck() {
         capacityTons: input.capacityTons,
         currentLocation: input.currentLocation.trim(),
         availabilityDate: input.availabilityDate,
+        driverName: input.driverName?.trim() || undefined,
+        driverPhone: input.driverPhone?.trim() || undefined,
+        ratePerTon: input.ratePerTon,
       });
       return { ok: true, truck: result.truck };
     } catch (e) {

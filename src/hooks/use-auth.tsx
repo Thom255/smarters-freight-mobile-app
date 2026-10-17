@@ -16,19 +16,28 @@ import {
   type ReactNode,
 } from 'react';
 
-import { api, ApiError } from '@/lib/api';
+import { api, ApiError, onUnauthorized } from '@/lib/api';
 import {
   toAuthFailure,
+  validateForgotPassword,
   validateLogin,
   validateRegister,
+  validateResetPassword,
   type AuthResult,
+  type ForgotPasswordInput,
   type LoginInput,
   type RegisterInput,
+  type ResetPasswordInput,
   type User,
 } from '@/lib/auth-core';
 import { clearSession, readSession, writeSession } from '@/lib/auth';
 
 export type AuthStatus = 'loading' | 'authenticated' | 'signedOut';
+
+/** Result of the two password-recovery steps screens need to render. */
+export type PasswordResetResult =
+  | { ok: true; message: string }
+  | { ok: false; field: string; message: string };
 
 export type AuthContextValue = {
   status: AuthStatus;
@@ -36,6 +45,8 @@ export type AuthContextValue = {
   signIn: (input: LoginInput) => Promise<AuthResult>;
   signUp: (input: RegisterInput) => Promise<AuthResult>;
   signOut: () => Promise<void>;
+  requestPasswordReset: (input: ForgotPasswordInput) => Promise<PasswordResetResult>;
+  resetPassword: (input: ResetPasswordInput) => Promise<PasswordResetResult>;
 };
 
 const AuthContext = createContext<AuthContextValue | null>(null);
@@ -43,6 +54,19 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<AuthStatus>('loading');
   const [user, setUser] = useState<User | null>(null);
+
+  /** Drops the local session without a server round trip. Idempotent. */
+  const clearLocalSession = useCallback(async () => {
+    await clearSession().catch(() => undefined);
+    setUser(null);
+    setStatus('signedOut');
+  }, []);
+
+  // Any authenticated request rejected with 401 (expired/revoked token, or a
+  // deleted account) ends the session here — the protected routes unmount and
+  // the user lands back on sign-in instead of staring at an error no refresh
+  // could fix.
+  useEffect(() => onUnauthorized(() => void clearLocalSession()), [clearLocalSession]);
 
   useEffect(() => {
     let active = true;
@@ -133,9 +157,49 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const requestPasswordReset = useCallback(
+    async (input: ForgotPasswordInput): Promise<PasswordResetResult> => {
+      const invalid = validateForgotPassword(input);
+      if (invalid) return { ok: false, field: invalid.field, message: invalid.message };
+
+      try {
+        const result = await api.forgotPassword({ identifier: input.identifier.trim() });
+        return { ok: true, message: result.message };
+      } catch (error) {
+        const failure = toAuthFailure(error);
+        return { ok: false, field: failure.field, message: failure.message };
+      }
+    },
+    [],
+  );
+
+  const resetPassword = useCallback(
+    async (input: ResetPasswordInput): Promise<PasswordResetResult> => {
+      const invalid = validateResetPassword(input);
+      if (invalid) return { ok: false, field: invalid.field, message: invalid.message };
+
+      try {
+        const result = await api.resetPassword(input);
+        return { ok: true, message: result.message };
+      } catch (error) {
+        const failure = toAuthFailure(error);
+        return { ok: false, field: failure.field, message: failure.message };
+      }
+    },
+    [],
+  );
+
   const value = useMemo<AuthContextValue>(
-    () => ({ status, user, signIn, signUp, signOut }),
-    [status, user, signIn, signUp, signOut],
+    () => ({
+      status,
+      user,
+      signIn,
+      signUp,
+      signOut,
+      requestPasswordReset,
+      resetPassword,
+    }),
+    [status, user, signIn, signUp, signOut, requestPasswordReset, resetPassword],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

@@ -1,7 +1,8 @@
 import { router, type Href } from 'expo-router';
-import { useState } from 'react';
-import { Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useMemo, useState } from 'react';
+import { Alert, Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
+import { ListControls, matchesQuery } from '@/components/list-controls';
 import {
   Badge,
   Button,
@@ -19,26 +20,79 @@ import { useCreateTruck, useTrucks, useUpdateTruck } from '@/hooks/use-trucks';
 import type { ApiTruck } from '@/lib/api';
 import {
   formatDate,
+  formatRate,
   formatTons,
   titleCaseStatus,
+  TRUCK_STATUSES,
   TRUCK_STATUS_TONE,
   TRUCK_TYPES,
 } from '@/lib/marketplace';
+
+const STATUS_FILTERS = TRUCK_STATUSES.map((value) => ({
+  value,
+  label: titleCaseStatus(value),
+}));
 
 export default function TrucksScreen() {
   const theme = useTheme();
   const { trucks, loading, refreshing, error, reload } = useTrucks();
   const { updateTruck } = useUpdateTruck();
   const [composerOpen, setComposerOpen] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [query, setQuery] = useState('');
+  const [status, setStatus] = useState<(typeof STATUS_FILTERS)[number]['value'] | 'all'>('all');
 
-  const count = trucks?.length ?? 0;
-  const subtitle = count > 0 ? `${count} truck${count === 1 ? '' : 's'} in your fleet` : undefined;
+  const filtered = useMemo(
+    () =>
+      (trucks ?? []).filter(
+        (truck) =>
+          (status === 'all' || truck.status === status) &&
+          matchesQuery(
+            query,
+            truck.registrationNumber,
+            truck.truckType,
+            truck.currentLocation,
+            truck.matchedCargo?.reference,
+          ),
+      ),
+    [trucks, query, status],
+  );
+  const filtering = query.trim() !== '' || status !== 'all';
 
-  const toggleAvailability = async (truck: ApiTruck) => {
-    await updateTruck(truck.id, {
-      status: truck.status === 'available' ? 'inactive' : 'available',
-    });
-    void reload();
+  const totalCount = trucks?.length ?? 0;
+  const count = filtered.length;
+  const subtitle =
+    totalCount > 0
+      ? filtering
+        ? `${count} of ${totalCount} truck${totalCount === 1 ? '' : 's'}`
+        : `${totalCount} truck${totalCount === 1 ? '' : 's'} in your fleet`
+      : undefined;
+
+  const toggleAvailability = (truck: ApiTruck) => {
+    const next = truck.status === 'available' ? 'inactive' : 'available';
+    Alert.alert(
+      next === 'inactive' ? 'Take truck off the market?' : 'Put truck back on the market?',
+      next === 'inactive'
+        ? `${truck.registrationNumber} will stop appearing in the marketplace and matching.`
+        : `${truck.registrationNumber} will appear as available to cargo owners.`,
+      [
+        { text: 'Never mind', style: 'cancel' },
+        {
+          text: next === 'inactive' ? 'Set unavailable' : 'Set available',
+          onPress: () => {
+            void (async () => {
+              setActionError(null);
+              const result = await updateTruck(truck.id, { status: next });
+              if (result.ok) {
+                await reload();
+              } else {
+                setActionError(result.message);
+              }
+            })();
+          },
+        },
+      ],
+    );
   };
 
   return (
@@ -51,11 +105,26 @@ export default function TrucksScreen() {
       <Header title="My trucks" subtitle={subtitle} back={false} />
 
       <View style={styles.body}>
+        {actionError ? (
+          <Text style={[theme.typography.caption, { color: theme.danger }]}>{actionError}</Text>
+        ) : null}
         <Button
           onPress={() => setComposerOpen(true)}
           iconLeft={<Icon name="plus" size={18} color={theme.onPrimary} />}>
           Add a truck
         </Button>
+
+        {!loading && totalCount > 0 ? (
+          <ListControls
+            query={query}
+            onQueryChange={setQuery}
+            placeholder="Search plate, type or location"
+            options={STATUS_FILTERS}
+            active={status}
+            onActiveChange={setStatus}
+            allLabel="All statuses"
+          />
+        ) : null}
 
         {error && !trucks ? (
           <Card>
@@ -76,7 +145,7 @@ export default function TrucksScreen() {
           </Card>
         ) : loading && !trucks ? (
           <SkeletonList count={3} />
-        ) : count === 0 ? (
+        ) : totalCount === 0 ? (
           <Card>
             <View style={styles.emptyState}>
               <View style={[styles.emptyIcon, { backgroundColor: theme.primarySubtle }]}>
@@ -97,8 +166,31 @@ export default function TrucksScreen() {
               </Button>
             </View>
           </Card>
+        ) : count === 0 ? (
+          <Card>
+            <View style={styles.emptyState}>
+              <View style={[styles.emptyIcon, { backgroundColor: theme.backgroundSelected }]}>
+                <Icon name="search" size={26} color={theme.textSecondary} />
+              </View>
+              <Text style={[theme.typography.subheading, { color: theme.text }]}>
+                No trucks match
+              </Text>
+              <Text style={[theme.typography.caption, styles.emptyText, { color: theme.textSecondary }]}>
+                No truck in your fleet matches these filters.
+              </Text>
+              <Button
+                fullWidth={false}
+                variant="outline"
+                onPress={() => {
+                  setQuery('');
+                  setStatus('all');
+                }}>
+                Clear filters
+              </Button>
+            </View>
+          </Card>
         ) : (
-          trucks?.map((truck, index) => (
+          filtered.map((truck, index) => (
             <FadeInView key={truck.id} index={index}>
               <Card>
                 <View style={styles.row}>
@@ -115,6 +207,13 @@ export default function TrucksScreen() {
                         ? ` · free ${formatDate(truck.availabilityDate)}`
                         : ''}
                     </Text>
+                    {truck.driverName || truck.ratePerTon != null ? (
+                      <Text style={[theme.typography.caption, { color: theme.textSecondary }]} numberOfLines={1}>
+                        {truck.driverName ? truck.driverName : ''}
+                        {truck.driverName && truck.ratePerTon != null ? ' · ' : ''}
+                        {truck.ratePerTon != null ? formatRate(truck.ratePerTon, 'TZS') : ''}
+                      </Text>
+                    ) : null}
                     {truck.matchedCargo ? (
                       <Text style={[theme.typography.caption, { color: theme.primary }]} numberOfLines={1}>
                         Booked with {truck.matchedCargo.reference} · {truck.matchedCargo.pickupLocation} →{' '}
@@ -140,7 +239,7 @@ export default function TrucksScreen() {
                     variant="ghost"
                     size="sm"
                     fullWidth={false}
-                    onPress={() => void toggleAvailability(truck)}
+                    onPress={() => toggleAvailability(truck)}
                     iconLeft={
                       <Icon
                         name={truck.status === 'available' ? 'hourglass' : 'check'}
@@ -193,6 +292,9 @@ function TruckComposer({
   const [capacity, setCapacity] = useState('');
   const [currentLocation, setCurrentLocation] = useState('');
   const [availabilityDate, setAvailabilityDate] = useState(todayISODate());
+  const [driverName, setDriverName] = useState('');
+  const [driverPhone, setDriverPhone] = useState('');
+  const [ratePerTon, setRatePerTon] = useState('');
   const [errors, setErrors] = useState<Record<string, string | undefined>>({});
 
   const clearError = (field: string) =>
@@ -202,12 +304,16 @@ function TruckComposer({
     if (submitting) return;
     setErrors({});
 
+    const parsedRate = Number.parseFloat(ratePerTon);
     const result = await createTruck({
       registrationNumber,
       truckType,
       capacityTons: Number.parseFloat(capacity) || 0,
       currentLocation,
       availabilityDate,
+      driverName: driverName || undefined,
+      driverPhone: driverPhone || undefined,
+      ratePerTon: Number.isFinite(parsedRate) && parsedRate > 0 ? parsedRate : undefined,
     });
 
     if (!result.ok) {
@@ -220,6 +326,9 @@ function TruckComposer({
     setCapacity('');
     setCurrentLocation('');
     setAvailabilityDate(todayISODate());
+    setDriverName('');
+    setDriverPhone('');
+    setRatePerTon('');
     onCreated();
   };
 
@@ -317,6 +426,36 @@ function TruckComposer({
               }}
               error={errors.availabilityDate}
               autoCapitalize="none"
+              returnKeyType="next"
+            />
+
+            <Input
+              label="Driver name (optional)"
+              placeholder="Juma Ally"
+              value={driverName}
+              onChangeText={setDriverName}
+              error={errors.driverName}
+              autoCapitalize="words"
+              returnKeyType="next"
+            />
+
+            <Input
+              label="Driver phone (optional)"
+              placeholder="+255 712 000 000"
+              value={driverPhone}
+              onChangeText={setDriverPhone}
+              error={errors.driverPhone}
+              keyboardType="phone-pad"
+              returnKeyType="next"
+            />
+
+            <Input
+              label="Rate per ton (optional)"
+              placeholder="45000"
+              value={ratePerTon}
+              onChangeText={setRatePerTon}
+              error={errors.ratePerTon}
+              keyboardType="number-pad"
               returnKeyType="done"
               onSubmitEditing={submit}
             />

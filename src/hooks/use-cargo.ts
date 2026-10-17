@@ -18,6 +18,8 @@ export type NewCargoInput = {
   pickupDate: string;
   preferredTruckType?: string;
   budget?: number;
+  /** ISO-4217 code; defaults to TZS on the server. */
+  currency?: string;
   specialRequirements?: string;
 };
 
@@ -124,6 +126,7 @@ export function useCreateCargo() {
         pickupDate: input.pickupDate,
         preferredTruckType: input.preferredTruckType?.trim() || undefined,
         budget: input.budget,
+        currency: input.currency,
         specialRequirements: input.specialRequirements?.trim() || undefined,
       });
       return { ok: true, cargo: result.cargo };

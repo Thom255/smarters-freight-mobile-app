@@ -1,9 +1,12 @@
 /**
- * Tests for the pure auth core (src/lib/auth-core.ts) and the API client
- * (src/lib/api.ts).
+ * Tests for the pure modules the app builds on:
+ *   - the auth core (src/lib/auth-core.ts)
+ *   - the API client (src/lib/api.ts)
+ *   - shipment presentation helpers (src/lib/shipments.ts)
+ *   - shipment form validation/mapping (src/lib/shipment-form.ts)
  *
  * Run with: node scripts/auth-core.test.mjs
- * Both modules have no React Native imports; Node strips the types and the
+ * These modules have no React Native imports; Node strips the types and the
  * API client is exercised against a mocked global fetch.
  */
 
@@ -18,6 +21,8 @@ const {
   normalizeIdentifier,
   validateLogin,
   validateRegister,
+  validateForgotPassword,
+  validateResetPassword,
   toAuthFailure,
 } = core;
 
@@ -102,6 +107,45 @@ async function run() {
     assert.equal(failure.field, 'password');
   });
 
+  // --- password recovery guards ----------------------------------------
+  check('validateForgotPassword flags a bad identifier', () => {
+    const failure = validateForgotPassword({ identifier: 'nope' });
+    assert.equal(failure.field, 'identifier');
+    assert.equal(validateForgotPassword({ identifier: 'a@b.com' }), null);
+  });
+  check('validateResetPassword requires a token', () => {
+    const failure = validateResetPassword({
+      identifier: 'a@b.com',
+      token: '',
+      password: PASSWORD,
+    });
+    assert.equal(failure.field, 'token');
+  });
+  check('validateResetPassword checks password and confirm', () => {
+    assert.equal(
+      validateResetPassword({
+        identifier: 'a@b.com',
+        token: 'sfr_x',
+        password: PASSWORD,
+        confirm: PASSWORD,
+      }),
+      null,
+    );
+    assert.equal(
+      validateResetPassword({ identifier: 'a@b.com', token: 'sfr_x', password: '123' }).field,
+      'password',
+    );
+    assert.equal(
+      validateResetPassword({
+        identifier: 'a@b.com',
+        token: 'sfr_x',
+        password: PASSWORD,
+        confirm: 'other',
+      }).field,
+      'confirm',
+    );
+  });
+
   // --- toAuthFailure mapping -------------------------------------------
   check('maps backend field error', () => {
     const failure = toAuthFailure({
@@ -115,6 +159,10 @@ async function run() {
   check('maps unknown field to form', () => {
     const failure = toAuthFailure({ field: 'weird', message: 'boom' });
     assert.equal(failure.field, 'form');
+  });
+  check('keeps the token field for reset errors', () => {
+    const failure = toAuthFailure({ field: 'token', message: 'This reset link is invalid.' });
+    assert.equal(failure.field, 'token');
   });
   check('maps non-error throwables to a generic message', () => {
     assert.equal(toAuthFailure(new Error('')).field, 'form');
@@ -216,9 +264,54 @@ async function run() {
       return new Response(
         JSON.stringify({
           ok: true,
-          stats: { shipments: 2, inTransit: 1, orders: 1 },
+          role: 'cargo_owner',
+          stats: {
+            shipments: 2,
+            booked: 1,
+            inTransit: 1,
+            delivered: 0,
+            cancelled: 0,
+            orders: 1,
+          },
+          marketplace: {
+            trucks: 3,
+            availableTrucks: 3,
+            cargo: 2,
+            postedCargo: 1,
+            matches: 2,
+          },
+          fleet: {
+            total: 0,
+            available: 0,
+            booked: 0,
+            inTransit: 0,
+            maintenance: 0,
+            inactive: 0,
+          },
+          loads: {
+            total: 2,
+            pending: 1,
+            confirmed: 1,
+            inTransit: 0,
+            completed: 0,
+            cancelled: 0,
+          },
+          bookings: { active: 1 },
           activeShipment: null,
+          upcomingDeliveries: [
+            {
+              id: 'shp_1',
+              reference: 'SF-ABC123',
+              origin: 'Dar es Salaam',
+              destination: 'Nairobi',
+              status: 'booked',
+              createdAt: 1_700_000_000_000,
+            },
+          ],
           recentActivity: [],
+          alerts: [
+            { id: 'awaiting-pickup', tone: 'info', title: '1 shipment awaiting pickup', body: null },
+          ],
         }),
         { status: 200, headers: { 'Content-Type': 'application/json' } },
       );
@@ -227,6 +320,11 @@ async function run() {
       const payload = await api.api.dashboard('sf_token');
       check('dashboard attaches bearer token and parses payload', () => {
         assert.equal(payload.stats.shipments, 2);
+        assert.equal(payload.stats.booked, 1);
+        assert.equal(payload.loads.pending, 1);
+        assert.equal(payload.bookings.active, 1);
+        assert.equal(payload.upcomingDeliveries.length, 1);
+        assert.equal(payload.alerts[0].tone, 'info');
         assert.deepEqual(payload.recentActivity, []);
       });
     },
@@ -344,53 +442,431 @@ async function run() {
 
   await withFetch(
     async (url, init) => {
-      assert.ok(String(url).endsWith('/api/matches/accept'));
+      assert.ok(String(url).endsWith('/api/bookings'));
       assert.equal(init.method, 'POST');
       assert.equal(init.headers.Authorization, 'Bearer sf_token');
       const body = JSON.parse(init.body);
       assert.equal(body.truckId, 't1');
       assert.equal(body.cargoId, 'c1');
+      assert.equal(body.price, 450000);
       return new Response(
         JSON.stringify({
           ok: true,
-          truck: { id: 't1', registrationNumber: 'T 123 ABC', status: 'booked', matchedCargoId: 'c1' },
-          cargo: { id: 'c1', reference: 'CG-ABC123', status: 'booked', matchedTruckId: 't1' },
+          booking: { id: 'b1', status: 'pending', direction: 'outgoing', price: 450000, currency: 'TZS' },
+          truck: { id: 't1', registrationNumber: 'T 123 ABC', status: 'available' },
+          cargo: { id: 'c1', reference: 'CG-ABC123', status: 'posted' },
         }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } },
+        { status: 201, headers: { 'Content-Type': 'application/json' } },
       );
     },
     async () => {
-      const payload = await api.api.acceptMatch('sf_token', { truckId: 't1', cargoId: 'c1' });
-      check('acceptMatch posts both ids and returns the booked records', () => {
-        assert.equal(payload.truck.status, 'booked');
-        assert.equal(payload.truck.matchedCargoId, 'c1');
-        assert.equal(payload.cargo.status, 'booked');
-        assert.equal(payload.cargo.matchedTruckId, 't1');
+      const payload = await api.api.requestBooking('sf_token', {
+        truckId: 't1',
+        cargoId: 'c1',
+        price: 450000,
+      });
+      check('requestBooking posts both ids + price and returns the pending booking', () => {
+        assert.equal(payload.booking.status, 'pending');
+        assert.equal(payload.booking.direction, 'outgoing');
+        assert.equal(payload.booking.price, 450000);
+        assert.equal(payload.booking.currency, 'TZS');
       });
     },
   );
 
   await withFetch(
     async (url) => {
-      assert.ok(String(url).endsWith('/api/matches/accept'));
+      assert.ok(String(url).endsWith('/api/bookings'));
       return new Response(
-        JSON.stringify({ ok: false, field: 'truck', message: 'That truck has just been booked' }),
+        JSON.stringify({ ok: false, field: 'truck', message: 'That truck is no longer available' }),
         { status: 409, headers: { 'Content-Type': 'application/json' } },
       );
     },
     async () => {
       try {
-        await api.api.acceptMatch('sf_token', { truckId: 't1', cargoId: 'c1' });
-        check('acceptMatch conflict surfaces as ApiError with field', () => {
+        await api.api.requestBooking('sf_token', { truckId: 't1', cargoId: 'c1' });
+        check('requestBooking conflict surfaces as ApiError with field', () => {
           assert.fail('should have thrown');
         });
       } catch (error) {
-        check('acceptMatch conflict surfaces as ApiError with field', () => {
+        check('requestBooking conflict surfaces as ApiError with field', () => {
           assert.ok(error instanceof api.ApiError);
           assert.equal(error.status, 409);
           assert.equal(error.field, 'truck');
         });
       }
+    },
+  );
+
+  await withFetch(
+    async (url, init) => {
+      assert.ok(String(url).endsWith('/api/bookings/b1/accept'));
+      assert.equal(init.method, 'POST');
+      assert.equal(init.headers.Authorization, 'Bearer sf_token');
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          booking: { id: 'b1', status: 'accepted', direction: 'incoming' },
+          truck: { id: 't1', status: 'booked' },
+          cargo: { id: 'c1', status: 'booked' },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    },
+    async () => {
+      const payload = await api.api.acceptBooking('sf_token', 'b1');
+      check('acceptBooking posts to the booking action and returns the accepted booking', () => {
+        assert.equal(payload.booking.status, 'accepted');
+        assert.equal(payload.truck.status, 'booked');
+      });
+    },
+  );
+
+  await withFetch(
+    async (url, init) => {
+      assert.ok(String(url).endsWith('/api/marketplace/trucks'));
+      assert.equal(init.method, 'GET');
+      assert.equal(init.headers.Authorization, 'Bearer sf_token');
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          trucks: [
+            {
+              id: 't1',
+              registrationNumber: 'T 123 ABC',
+              truckType: 'Flatbed',
+              status: 'available',
+              driverName: 'Juma Ally',
+              ratePerTon: 45000,
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    },
+    async () => {
+      const payload = await api.api.marketplaceTrucks('sf_token');
+      check('marketplaceTrucks fetches the open fleet with driver + rate', () => {
+        assert.equal(payload.trucks.length, 1);
+        assert.equal(payload.trucks[0].driverName, 'Juma Ally');
+        assert.equal(payload.trucks[0].ratePerTon, 45000);
+      });
+    },
+  );
+
+  // --- password recovery -------------------------------------------------
+  await withFetch(
+    async (url, init) => {
+      assert.ok(String(url).endsWith('/api/auth/forgot-password'));
+      assert.equal(init.method, 'POST');
+      // No Authorization header — recovery is a public endpoint.
+      assert.equal(init.headers.Authorization, undefined);
+      const body = JSON.parse(init.body);
+      assert.equal(body.identifier, 'amina@co.tz');
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          message: 'If an account exists with that email or phone, we have sent reset instructions.',
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    },
+    async () => {
+      const result = await api.api.forgotPassword({ identifier: 'amina@co.tz' });
+      check('forgotPassword posts the identifier and returns a neutral message', () => {
+        assert.equal(result.ok, true);
+        assert.ok(result.message.includes('reset instructions'));
+      });
+    },
+  );
+
+  await withFetch(
+    async (url, init) => {
+      assert.ok(String(url).endsWith('/api/auth/reset-password'));
+      assert.equal(init.method, 'POST');
+      const body = JSON.parse(init.body);
+      assert.equal(body.identifier, 'amina@co.tz');
+      assert.equal(body.token, 'sfr_abc');
+      assert.equal(body.password, 'new-secret');
+      return new Response(JSON.stringify({ ok: true, message: 'Your password has been reset.' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    },
+    async () => {
+      const result = await api.api.resetPassword({
+        identifier: 'amina@co.tz',
+        token: 'sfr_abc',
+        password: 'new-secret',
+      });
+      check('resetPassword posts the token and new password', () => {
+        assert.equal(result.ok, true);
+        assert.ok(result.message.includes('reset'));
+      });
+    },
+  );
+
+  // --- shipment form helpers + presentation ------------------------------
+  const shipLib = await import('../src/lib/shipments.ts');
+  const form = await import('../src/lib/shipment-form.ts');
+  const { EMPTY_SHIPMENT_FORM } = form;
+
+  check('shipment status label maps booked to Confirmed', () => {
+    assert.equal(shipLib.shipmentStatusLabel('booked'), 'Confirmed');
+    assert.equal(shipLib.shipmentStatusLabel('in_transit'), 'In transit');
+    assert.equal(shipLib.shipmentStatusLabel('delivered'), 'Delivered');
+    assert.equal(shipLib.shipmentStatusLabel('cancelled'), 'Cancelled');
+  });
+
+  check('isoDate formats a local date as YYYY-MM-DD', () => {
+    assert.equal(shipLib.isoDate(new Date(2026, 9, 7).getTime()), '2026-10-07');
+    assert.equal(shipLib.isoDate(null), '');
+    assert.equal(shipLib.isoDate(undefined), '');
+  });
+
+  check('formatShipmentWeight renders tons and blanks', () => {
+    assert.equal(shipLib.formatShipmentWeight(12.5), '12.5 t');
+    assert.equal(shipLib.formatShipmentWeight(12), '12 t');
+    assert.equal(shipLib.formatShipmentWeight(null), '');
+    assert.equal(shipLib.formatShipmentWeight(undefined), '');
+  });
+
+  check('validateShipmentForm requires origin and destination', () => {
+    const errors = form.validateShipmentForm({ ...EMPTY_SHIPMENT_FORM, origin: 'A' });
+    assert.equal(errors.origin, 'Enter the pickup location');
+    assert.equal(errors.destination, 'Enter the destination');
+    assert.equal(form.hasShipmentFormErrors(errors), true);
+  });
+
+  check('validateShipmentForm rejects non-positive weight', () => {
+    const errors = form.validateShipmentForm({
+      ...EMPTY_SHIPMENT_FORM,
+      origin: 'Dar',
+      destination: 'Nairobi',
+      weightTons: '0',
+    });
+    assert.ok(errors.weightTons);
+  });
+
+  check('validateShipmentForm checks date format and ordering', () => {
+    assert.ok(
+      form.validateShipmentForm({
+        ...EMPTY_SHIPMENT_FORM,
+        origin: 'Dar',
+        destination: 'Nairobi',
+        pickupDate: '20-10-2026',
+      }).pickupDate,
+    );
+
+    const errors = form.validateShipmentForm({
+      ...EMPTY_SHIPMENT_FORM,
+      origin: 'Dar',
+      destination: 'Nairobi',
+      pickupDate: '2026-10-20',
+      deliveryDeadline: '2026-10-10',
+    });
+    assert.ok(errors.deliveryDeadline);
+  });
+
+  check('validateShipmentForm passes a valid form', () => {
+    const errors = form.validateShipmentForm({
+      ...EMPTY_SHIPMENT_FORM,
+      origin: 'Dar es Salaam',
+      destination: 'Nairobi',
+      weightTons: '12.5',
+      pickupDate: '2026-10-20',
+      deliveryDeadline: '2026-10-27',
+    });
+    assert.equal(form.hasShipmentFormErrors(errors), false);
+  });
+
+  check('shipmentFormFrom prefills from an existing shipment', () => {
+    const values = form.shipmentFormFrom({
+      id: 's1',
+      reference: 'SF-ABC123',
+      origin: 'Dar es Salaam',
+      destination: 'Nairobi',
+      status: 'booked',
+      notes: 'Fragile',
+      createdAt: 1,
+      cargoType: 'Cement',
+      weightTons: 12.5,
+      pickupDate: new Date(2026, 9, 7).getTime(),
+      assignedTruckId: 't1',
+    });
+    assert.equal(values.origin, 'Dar es Salaam');
+    assert.equal(values.cargoType, 'Cement');
+    assert.equal(values.weightTons, '12.5');
+    assert.equal(values.pickupDate, '2026-10-07');
+    assert.equal(values.deliveryDeadline, '');
+    assert.equal(values.assignedTruckId, 't1');
+  });
+
+  check('shipmentFormToCreateInput trims and drops blanks', () => {
+    const input = form.shipmentFormToCreateInput({
+      ...EMPTY_SHIPMENT_FORM,
+      origin: '  Dar es Salaam ',
+      destination: 'Nairobi',
+      weightTons: '12.5',
+      cargoType: '',
+      notes: '   ',
+    });
+    assert.equal(input.origin, 'Dar es Salaam');
+    assert.equal(input.destination, 'Nairobi');
+    assert.equal(input.weightTons, 12.5);
+    assert.equal(input.cargoType, undefined);
+    assert.equal(input.notes, undefined);
+  });
+
+  check('shipmentFormToUpdateInput uses null to clear blanks', () => {
+    const input = form.shipmentFormToUpdateInput({
+      ...EMPTY_SHIPMENT_FORM,
+      origin: 'Dar es Salaam',
+      destination: 'Nairobi',
+      weightTons: '',
+      cargoType: '',
+      bookingReference: 'BK-1',
+    });
+    assert.equal(input.weightTons, null);
+    assert.equal(input.cargoType, null);
+    assert.equal(input.bookingReference, 'BK-1');
+  });
+
+  await withFetch(
+    async (url, init) => {
+      assert.ok(String(url).endsWith('/api/shipments'));
+      assert.equal(init.method, 'POST');
+      assert.equal(init.headers.Authorization, 'Bearer sf_token');
+      const body = JSON.parse(init.body);
+      assert.equal(body.origin, 'Dar es Salaam');
+      assert.equal(body.destination, 'Nairobi');
+      assert.equal(body.weightTons, 12.5);
+      assert.equal(body.assignedTruckId, 't1');
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          shipment: {
+            id: 's9',
+            reference: 'SF-NEW123',
+            origin: 'Dar es Salaam',
+            destination: 'Nairobi',
+            status: 'booked',
+            notes: null,
+            createdAt: 1,
+            weightTons: 12.5,
+            assignedTruckId: 't1',
+          },
+        }),
+        { status: 201, headers: { 'Content-Type': 'application/json' } },
+      );
+    },
+    async () => {
+      const payload = await api.api.createShipment('sf_token', {
+        origin: 'Dar es Salaam',
+        destination: 'Nairobi',
+        weightTons: 12.5,
+        assignedTruckId: 't1',
+      });
+      check('createShipment posts camelCase body and parses the new shipment', () => {
+        assert.equal(payload.shipment.id, 's9');
+        assert.equal(payload.shipment.status, 'booked');
+        assert.equal(payload.shipment.weightTons, 12.5);
+        assert.equal(payload.shipment.assignedTruckId, 't1');
+      });
+    },
+  );
+
+  await withFetch(
+    async (url, init) => {
+      assert.ok(String(url).endsWith('/api/shipments/s9'));
+      assert.equal(init.method, 'PATCH');
+      assert.equal(init.headers.Authorization, 'Bearer sf_token');
+      const body = JSON.parse(init.body);
+      assert.equal(body.status, 'in_transit');
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          shipment: {
+            id: 's9',
+            reference: 'SF-NEW123',
+            origin: 'Dar es Salaam',
+            destination: 'Nairobi',
+            status: 'in_transit',
+            notes: null,
+            createdAt: 1,
+          },
+          event: {
+            id: 'e1',
+            type: 'in_transit',
+            title: 'In transit',
+            body: 'Dar es Salaam → Nairobi',
+            createdAt: 2,
+            actor: 'Amina',
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    },
+    async () => {
+      const payload = await api.api.updateShipment('sf_token', 's9', { status: 'in_transit' });
+      check('updateShipment patches the status and returns the recorded event', () => {
+        assert.equal(payload.shipment.status, 'in_transit');
+        assert.equal(payload.event?.actor, 'Amina');
+        assert.equal(payload.event?.type, 'in_transit');
+      });
+    },
+  );
+
+  // --- central 401 handling ------------------------------------------------
+  await withFetch(
+    async () =>
+      new Response(JSON.stringify({ ok: false, field: 'session', message: 'Session expired' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    async () => {
+      let fired = 0;
+      const unsubscribe = api.onUnauthorized(() => {
+        fired += 1;
+      });
+
+      try {
+        await api.api.shipments('sf_expired');
+      } catch {
+        // expected
+      }
+
+      unsubscribe();
+
+      check('a token-bearing 401 notifies subscribers once', () => {
+        assert.equal(fired, 1);
+      });
+    },
+  );
+
+  await withFetch(
+    async () =>
+      new Response(JSON.stringify({ ok: false, field: 'password', message: 'Incorrect password' }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    async () => {
+      let fired = 0;
+      const unsubscribe = api.onUnauthorized(() => {
+        fired += 1;
+      });
+
+      try {
+        await api.api.login({ identifier: 'amina@co.tz', password: 'wrong' });
+      } catch {
+        // expected
+      }
+
+      unsubscribe();
+
+      check('a login 401 does not notify subscribers', () => {
+        assert.equal(fired, 0);
+      });
     },
   );
 

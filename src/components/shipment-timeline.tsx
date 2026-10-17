@@ -8,7 +8,7 @@ import type { ShipmentStatus } from '@/lib/shipments';
 type Step = { key: ShipmentStatus; label: string; hint: string };
 
 const STEPS: Step[] = [
-  { key: 'booked', label: 'Booked', hint: 'Load confirmed and ready for pickup.' },
+  { key: 'booked', label: 'Confirmed', hint: 'Load confirmed and ready for pickup.' },
   { key: 'in_transit', label: 'In transit', hint: 'On the road to the destination.' },
   { key: 'delivered', label: 'Delivered', hint: 'Handed over at the destination.' },
 ];
@@ -19,7 +19,7 @@ export function ShipmentTimeline({ status }: { status: ShipmentStatus }) {
     return (
       <View style={styles.timeline}>
         <TimelineRow
-          label="Booked"
+          label="Confirmed"
           hint="Load was confirmed before cancellation."
           state="done"
           last={false}

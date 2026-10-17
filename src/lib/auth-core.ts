@@ -26,6 +26,7 @@ export type AuthField =
   | 'password'
   | 'confirm'
   | 'role'
+  | 'token'
   | 'form';
 
 export type AuthSuccess = { ok: true; user: User };
@@ -44,6 +45,17 @@ export type RegisterInput = {
 export type LoginInput = {
   identifier: string;
   password: string;
+};
+
+export type ForgotPasswordInput = {
+  identifier: string;
+};
+
+export type ResetPasswordInput = {
+  identifier: string;
+  token: string;
+  password: string;
+  confirm?: string;
 };
 
 /** Emails and phone numbers are matched case-insensitively and trimmed. */
@@ -120,12 +132,45 @@ export function validateLogin(input: LoginInput): AuthFailure | null {
   return null;
 }
 
+/** First failing field for the forgot-password form, or null when it may be sent. */
+export function validateForgotPassword(input: ForgotPasswordInput): AuthFailure | null {
+  const identifierError = validateIdentifier(input.identifier);
+  if (identifierError) return { ok: false, field: 'identifier', message: identifierError };
+
+  return null;
+}
+
+/** First failing field for the reset-password form, or null when it may be sent. */
+export function validateResetPassword(input: ResetPasswordInput): AuthFailure | null {
+  if (!input.token?.trim()) {
+    return {
+      ok: false,
+      field: 'token',
+      message: 'This reset link is invalid. Request a new one.',
+    };
+  }
+
+  const identifierError = validateIdentifier(input.identifier);
+  if (identifierError) return { ok: false, field: 'identifier', message: identifierError };
+
+  const passwordError = validatePassword(input.password);
+  if (passwordError) return { ok: false, field: 'password', message: passwordError };
+
+  if (input.confirm !== undefined) {
+    const confirmError = validateConfirm(input.password, input.confirm);
+    if (confirmError) return { ok: false, field: 'confirm', message: confirmError };
+  }
+
+  return null;
+}
+
 const KNOWN_FIELDS: readonly string[] = [
   'name',
   'identifier',
   'password',
   'confirm',
   'role',
+  'token',
   'form',
 ];
 

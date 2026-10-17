@@ -17,9 +17,7 @@ use Symfony\Component\HttpFoundation\Response;
  */
 class AuthenticateApi
 {
-    public function __construct(private SupabaseClient $supabase)
-    {
-    }
+    public function __construct(private SupabaseClient $supabase) {}
 
     public function handle(Request $request, Closure $next): Response
     {
@@ -29,8 +27,11 @@ class AuthenticateApi
             return $this->unauthorized('Missing bearer token');
         }
 
+        // One round trip: the token row arrives with its user embedded
+        // (PostgREST resource embedding). The serial fallback below keeps the
+        // middleware working if the embed is ever unavailable.
         $token = $this->supabase->selectOne('api_tokens', [
-            'select' => '*',
+            'select' => '*,users(*)',
             'token_hash' => 'eq.'.hash('sha256', $raw),
         ]);
 
@@ -42,9 +43,11 @@ class AuthenticateApi
             return $this->unauthorized('Session expired, sign in again');
         }
 
-        $user = $this->supabase->selectOne('users', [
-            'id' => 'eq.'.$token['user_id'],
-        ]);
+        $user = is_array($token['users'] ?? null) && ! empty($token['users']['id'])
+            ? $token['users']
+            : $this->supabase->selectOne('users', [
+                'id' => 'eq.'.$token['user_id'],
+            ]);
 
         if ($user === null) {
             return $this->unauthorized('Account no longer exists');
@@ -53,13 +56,19 @@ class AuthenticateApi
         $request->attributes->set('auth_user', $user);
         $request->attributes->set('token_id', $token['id']);
 
-        // Fire-and-forget activity stamp; failures must not break the request.
-        try {
-            $this->supabase->update('api_tokens', 'id', 'eq.'.$token['id'], [
-                'last_used_at' => now()->toIso8601String(),
-            ]);
-        } catch (\Throwable) {
-            // Intentionally ignored.
+        // Activity stamp, written at most once every five minutes. It used to
+        // run on every request, and this write is a whole extra round trip to
+        // Supabase (~1s) in front of the endpoint the user is waiting for.
+        $lastUsed = (int) strtotime((string) ($token['last_used_at'] ?? ''));
+
+        if ($lastUsed <= 0 || (time() - $lastUsed) > 300) {
+            try {
+                $this->supabase->update('api_tokens', 'id', 'eq.'.$token['id'], [
+                    'last_used_at' => now()->toIso8601String(),
+                ]);
+            } catch (\Throwable) {
+                // Intentionally ignored — telemetry must never fail a request.
+            }
         }
 
         return $next($request);

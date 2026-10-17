@@ -1,20 +1,24 @@
 /**
  * Shipment data + actions through the Laravel backend:
- * list/detail fetching (shipments screens) and creation (dashboard's
- * "New shipment" button).
+ * list/detail fetching (shipments screens), creation (new-shipment screen)
+ * and updates (status transitions + detail edits on the detail screen).
  */
 
 import { useCallback, useEffect, useState } from 'react';
 
 import { useAuth } from '@/hooks/use-auth';
-import { api, ApiError, type ApiShipment } from '@/lib/api';
+import {
+  api,
+  ApiError,
+  type ApiShipment,
+  type ShipmentUpdateInput,
+} from '@/lib/api';
 import { readSession } from '@/lib/auth';
-
-export type NewShipmentInput = {
-  origin: string;
-  destination: string;
-  notes?: string;
-};
+import {
+  shipmentFormToCreateInput,
+  validateShipmentForm,
+  type ShipmentFormValues,
+} from '@/lib/shipment-form';
 
 export type CreateShipmentResult =
   | { ok: true; shipment: ApiShipment }
@@ -156,18 +160,17 @@ export function useShipment(id: string) {
 
 /**
  * Returns createShipment + submitting flag. The caller owns the form; this
- * hook only handles validation, the request, and field-aware error mapping.
+ * hook validates (again), posts the shipment and maps field errors.
  */
 export function useCreateShipment() {
   const [submitting, setSubmitting] = useState(false);
 
   const createShipment = useCallback(
-    async (input: NewShipmentInput): Promise<CreateShipmentResult> => {
-      if (input.origin.trim().length < 2) {
-        return { ok: false, field: 'origin', message: 'Enter the pickup location' };
-      }
-      if (input.destination.trim().length < 2) {
-        return { ok: false, field: 'destination', message: 'Enter the destination' };
+    async (values: ShipmentFormValues): Promise<CreateShipmentResult> => {
+      const errors = validateShipmentForm(values);
+      const firstField = Object.keys(errors)[0] as keyof typeof errors | undefined;
+      if (firstField) {
+        return { ok: false, field: firstField, message: errors[firstField] as string };
       }
 
       setSubmitting(true);
@@ -177,11 +180,7 @@ export function useCreateShipment() {
           return { ok: false, field: 'form', message: 'Session expired. Sign in again.' };
         }
 
-        const result = await api.createShipment(session.token, {
-          origin: input.origin.trim(),
-          destination: input.destination.trim(),
-          notes: input.notes?.trim() || undefined,
-        });
+        const result = await api.createShipment(session.token, shipmentFormToCreateInput(values));
         return { ok: true, shipment: result.shipment };
       } catch (e) {
         if (e instanceof ApiError) {
@@ -196,4 +195,42 @@ export function useCreateShipment() {
   );
 
   return { createShipment, submitting };
+}
+
+export type UpdateShipmentResult =
+  | { ok: true; shipment: ApiShipment }
+  | { ok: false; field: string; message: string };
+
+/**
+ * Sends a status transition or a detail edit for one shipment. The caller owns
+ * any confirm dialog and re-fetches with `reload()` afterwards so the timeline
+ * shows the event the backend just recorded.
+ */
+export function useUpdateShipment() {
+  const [saving, setSaving] = useState(false);
+
+  const updateShipment = useCallback(
+    async (id: string, input: ShipmentUpdateInput): Promise<UpdateShipmentResult> => {
+      setSaving(true);
+      try {
+        const session = await readSession().catch(() => null);
+        if (!session?.token) {
+          return { ok: false, field: 'form', message: 'Session expired. Sign in again.' };
+        }
+
+        const result = await api.updateShipment(session.token, id, input);
+        return { ok: true, shipment: result.shipment };
+      } catch (e) {
+        if (e instanceof ApiError) {
+          return { ok: false, field: e.field, message: e.message };
+        }
+        return { ok: false, field: 'form', message: 'Could not update this shipment.' };
+      } finally {
+        setSaving(false);
+      }
+    },
+    [],
+  );
+
+  return { updateShipment, saving };
 }

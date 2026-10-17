@@ -45,6 +45,22 @@ export default function AppTabs() {
         />
       </NativeTabs.Trigger>
 
+      <NativeTabs.Trigger name="marketplace">
+        <NativeTabs.Trigger.Label>Market</NativeTabs.Trigger.Label>
+        <NativeTabs.Trigger.Icon
+          sf={{ default: 'magnifyingglass', selected: 'magnifyingglass' }}
+          md={{ default: 'storefront', selected: 'storefront' }}
+        />
+      </NativeTabs.Trigger>
+
+      <NativeTabs.Trigger name="bookings">
+        <NativeTabs.Trigger.Label>Bookings</NativeTabs.Trigger.Label>
+        <NativeTabs.Trigger.Icon
+          sf={{ default: 'checkmark.seal', selected: 'checkmark.seal.fill' }}
+          md={{ default: 'fact_check', selected: 'fact_check' }}
+        />
+      </NativeTabs.Trigger>
+
       {isTruckOwner ? (
         <NativeTabs.Trigger name="trucks">
           <NativeTabs.Trigger.Label>Fleet</NativeTabs.Trigger.Label>

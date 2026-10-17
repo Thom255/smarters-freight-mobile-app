@@ -19,6 +19,7 @@ const sources = {
   chevronDown: { ios: 'chevron.down', android: 'expand_more', web: 'expand_more' },
   person: { ios: 'person', android: 'person', web: 'person' },
   plus: { ios: 'plus', android: 'add', web: 'add' },
+  edit: { ios: 'pencil', android: 'edit', web: 'edit' },
   search: { ios: 'magnifyingglass', android: 'search', web: 'search' },
   swap: { ios: 'arrow.left.arrow.right', android: 'swap_horiz', web: 'swap_horiz' },
   card: { ios: 'creditcard', android: 'payments', web: 'payments' },

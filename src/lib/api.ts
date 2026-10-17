@@ -35,6 +35,35 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Central 401 handling.
+ *
+ * When a *token-bearing* request is rejected as unauthorized the saved session
+ * is no longer usable (expired, revoked, or the account is gone). Rather than
+ * make every data hook aware of auth state, the request layer notifies
+ * subscribers — the AuthProvider clears the session and flips the app to
+ * signed-out, which unmounts the protected routes. Login/register/forgot/
+ * reset never carry a token, so a wrong-password 401 there does not fire it.
+ */
+type UnauthorizedHandler = () => void;
+const unauthorizedHandlers = new Set<UnauthorizedHandler>();
+
+/** Subscribe to "an authenticated request was rejected". Returns an unsubscribe. */
+export function onUnauthorized(handler: UnauthorizedHandler): () => void {
+  unauthorizedHandlers.add(handler);
+  return () => unauthorizedHandlers.delete(handler);
+}
+
+function notifyUnauthorized(): void {
+  unauthorizedHandlers.forEach((handler) => {
+    try {
+      handler();
+    } catch {
+      // A subscriber must never break the request that triggered it.
+    }
+  });
+}
+
 type RequestOptions = {
   method?: 'GET' | 'POST' | 'PATCH' | 'DELETE';
   body?: unknown;
@@ -73,7 +102,14 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
       (response.status === 401
         ? 'Session expired. Please sign in again.'
         : `Request failed (${response.status})`);
-    const field = shape.field ?? (response.status === 401 ? 'form' : 'form');
+    const field = shape.field ?? 'form';
+
+    // A rejected authenticated call means the stored session is dead — tell
+    // the AuthProvider so it can clear it and return to the sign-in screen.
+    if (response.status === 401 && token) {
+      notifyUnauthorized();
+    }
+
     throw new ApiError(message, response.status, field);
   }
 
@@ -122,6 +158,11 @@ export type ApiTruck = {
   capacityTons: number;
   currentLocation: string;
   availabilityDate: number | null;
+  /** Optional driver details the owner may add. */
+  driverName: string | null;
+  driverPhone: string | null;
+  /** Quoting basis — price per ton carried. */
+  ratePerTon: number | null;
   status: TruckStatus;
   verificationStatus: 'pending' | 'verified' | 'rejected';
   /** Set while this truck is booked for a load. */
@@ -151,6 +192,8 @@ export type ApiCargo = {
   pickupDate: number | null;
   preferredTruckType: string | null;
   budget: number | null;
+  /** ISO-4217 code the budget/price is quoted in, e.g. 'TZS'. */
+  currency: string;
   specialRequirements: string | null;
   status: CargoStatus;
   /** Set while this load is booked with a truck. */
@@ -175,6 +218,43 @@ export type ApiMatch = {
   };
   truck: ApiTruck;
   cargo: ApiCargo;
+  /** Estimated cost for the haul (rate × weight, else the load budget). */
+  estimatedCost: number | null;
+};
+
+export type BookingStatus = 'pending' | 'accepted' | 'rejected' | 'cancelled';
+
+/** The other side of a booking, resolved enough to display and call. */
+export type ApiParty = {
+  id: string;
+  name: string | null;
+  companyName: string | null;
+};
+
+export type ApiBooking = {
+  id: string;
+  status: BookingStatus;
+  /** 'incoming' when the caller owns the truck, 'outgoing' when they own the load. */
+  direction: 'incoming' | 'outgoing';
+  price: number | null;
+  currency: string;
+  message: string | null;
+  requestedAt: number | null;
+  decidedAt: number | null;
+  cargo: ApiCargo;
+  truck: ApiTruck;
+  requester: ApiParty;
+  responder: ApiParty;
+};
+
+export type ApiShipmentEvent = {
+  id: string;
+  type: string;
+  title: string;
+  body: string | null;
+  createdAt: number | null;
+  /** Display name of the user who made the change, when known. */
+  actor: string | null;
 };
 
 export type ApiShipment = {
@@ -185,6 +265,63 @@ export type ApiShipment = {
   status: 'booked' | 'in_transit' | 'delivered' | 'cancelled';
   notes: string | null;
   createdAt: number | null;
+  updatedAt?: number | null;
+  /** Cargo + planning detail (present since the shipment-details migration). */
+  cargoType?: string | null;
+  cargoDescription?: string | null;
+  /** Tons; null when not yet recorded. */
+  weightTons?: number | null;
+  /** Free text, e.g. "12 x 2.4 x 2.6 m". */
+  dimensions?: string | null;
+  /** Epoch ms of the planned pickup day. */
+  pickupDate?: number | null;
+  /** Epoch ms of the day the load is due. */
+  deliveryDeadline?: number | null;
+  bookingReference?: string | null;
+  assignedTruckId?: string | null;
+  /** Resolved truck summary — only on detail / create / update responses. */
+  assignedTruck?: MatchedTruckSummary | null;
+  /** Status history — populated by GET /api/shipments/{id}. */
+  events?: ApiShipmentEvent[];
+};
+
+export type ShipmentStatusUpdate = 'in_transit' | 'delivered' | 'cancelled';
+
+/** Body for POST /api/shipments. */
+export type ShipmentCreateInput = {
+  origin: string;
+  destination: string;
+  notes?: string;
+  cargoType?: string;
+  cargoDescription?: string;
+  weightTons?: number;
+  dimensions?: string;
+  /** 'YYYY-MM-DD' */
+  pickupDate?: string;
+  /** 'YYYY-MM-DD' */
+  deliveryDeadline?: string;
+  bookingReference?: string;
+  assignedTruckId?: string;
+};
+
+/**
+ * Body for PATCH /api/shipments/{id}. `status` performs a lifecycle
+ * transition; the remaining fields edit details (only while active).
+ * Send `null` to clear an optional field.
+ */
+export type ShipmentUpdateInput = {
+  status?: ShipmentStatusUpdate;
+  notes?: string | null;
+  origin?: string;
+  destination?: string;
+  cargoType?: string | null;
+  cargoDescription?: string | null;
+  weightTons?: number | null;
+  dimensions?: string | null;
+  pickupDate?: string | null;
+  deliveryDeadline?: string | null;
+  bookingReference?: string | null;
+  assignedTruckId?: string | null;
 };
 
 export type ApiActivity = {
@@ -196,10 +333,66 @@ export type ApiActivity = {
   reference: string | null;
 };
 
+/** Lifecycle breakdown of the caller's own shipments. */
+export type DashboardShipmentStats = {
+  shipments: number;
+  booked: number;
+  inTransit: number;
+  delivered: number;
+  cancelled: number;
+  /** Legacy alias for `booked`. */
+  orders: number;
+};
+
+/** The caller's own fleet, by status. All zero for cargo owners. */
+export type DashboardFleet = {
+  total: number;
+  available: number;
+  booked: number;
+  inTransit: number;
+  maintenance: number;
+  inactive: number;
+};
+
+/** The caller's own loads, grouped. All zero for truck owners. */
+export type DashboardLoads = {
+  total: number;
+  pending: number;
+  confirmed: number;
+  inTransit: number;
+  completed: number;
+  cancelled: number;
+};
+
+/** Alert tone — mirrors BadgeTone without importing the UI layer. */
+export type DashboardAlertTone =
+  | 'neutral'
+  | 'primary'
+  | 'success'
+  | 'warning'
+  | 'danger'
+  | 'info';
+
+export type DashboardAlert = {
+  id: string;
+  tone: DashboardAlertTone;
+  title: string;
+  body: string | null;
+};
+
+export type DashboardDelivery = {
+  id: string;
+  reference: string | null;
+  origin: string;
+  destination: string;
+  status: ApiShipment['status'];
+  createdAt: number | null;
+};
+
 export type DashboardPayload = {
   ok: true;
   role: UserRole;
-  stats: { shipments: number; inTransit: number; orders: number };
+  stats: DashboardShipmentStats;
   marketplace: {
     trucks: number;
     availableTrucks: number;
@@ -207,8 +400,13 @@ export type DashboardPayload = {
     postedCargo: number;
     matches: number;
   };
+  fleet: DashboardFleet;
+  loads: DashboardLoads;
+  bookings: { active: number };
   activeShipment: Omit<ApiShipment, 'notes'> | null;
+  upcomingDeliveries: DashboardDelivery[];
   recentActivity: ApiActivity[];
+  alerts: DashboardAlert[];
 };
 
 // ---------------------------------------------------------------------------
@@ -229,6 +427,21 @@ export const api = {
 
   login(input: { identifier: string; password: string }): Promise<AuthPayload> {
     return request('/api/auth/login', { method: 'POST', body: input });
+  },
+
+  /** Starts the reset flow. Always resolves with a neutral confirmation. */
+  forgotPassword(input: { identifier: string }): Promise<{ ok: true; message: string }> {
+    return request('/api/auth/forgot-password', { method: 'POST', body: input });
+  },
+
+  /** Completes the reset flow with the one-time token from the email link. */
+  resetPassword(input: {
+    identifier: string;
+    token: string;
+    password: string;
+    confirm?: string;
+  }): Promise<{ ok: true; message: string }> {
+    return request('/api/auth/reset-password', { method: 'POST', body: input });
   },
 
   logout(token: string): Promise<{ ok: true }> {
@@ -256,9 +469,25 @@ export const api = {
 
   createShipment(
     token: string,
-    input: { origin: string; destination: string; notes?: string },
+    input: ShipmentCreateInput,
   ): Promise<{ ok: true; shipment: ApiShipment }> {
     return request('/api/shipments', { method: 'POST', body: input, token });
+  },
+
+  /**
+   * Move a shipment along its lifecycle (booked → in transit → delivered), or
+   * edit its details while it is still active.
+   */
+  updateShipment(
+    token: string,
+    id: string,
+    input: ShipmentUpdateInput,
+  ): Promise<{ ok: true; shipment: ApiShipment; event?: ApiShipmentEvent }> {
+    return request(`/api/shipments/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: input,
+      token,
+    });
   },
 
   // --- Marketplace: trucks (SRS §14) -------------------------------------
@@ -274,6 +503,9 @@ export const api = {
       capacityTons: number;
       currentLocation: string;
       availabilityDate: string;
+      driverName?: string;
+      driverPhone?: string;
+      ratePerTon?: number;
     },
   ): Promise<{ ok: true; truck: ApiTruck }> {
     return request('/api/trucks', { method: 'POST', body: input, token });
@@ -282,7 +514,14 @@ export const api = {
   updateTruck(
     token: string,
     id: string,
-    input: { status?: TruckStatus; currentLocation?: string; availabilityDate?: string },
+    input: {
+      status?: TruckStatus;
+      currentLocation?: string;
+      availabilityDate?: string;
+      driverName?: string | null;
+      driverPhone?: string | null;
+      ratePerTon?: number | null;
+    },
   ): Promise<{ ok: true; truck: ApiTruck }> {
     return request(`/api/trucks/${encodeURIComponent(id)}`, {
       method: 'PATCH',
@@ -307,6 +546,7 @@ export const api = {
       pickupDate: string;
       preferredTruckType?: string;
       budget?: number;
+      currency?: string;
       specialRequirements?: string;
     },
   ): Promise<{ ok: true; cargo: ApiCargo }> {
@@ -316,7 +556,7 @@ export const api = {
   updateCargo(
     token: string,
     id: string,
-    input: { status?: CargoStatus; pickupDate?: string; budget?: number | null },
+    input: { status?: CargoStatus; pickupDate?: string; budget?: number | null; currency?: string },
   ): Promise<{ ok: true; cargo: ApiCargo }> {
     return request(`/api/cargo/${encodeURIComponent(id)}`, {
       method: 'PATCH',
@@ -344,11 +584,56 @@ export const api = {
     return request(`/api/matches/truck/${encodeURIComponent(id)}`, { token });
   },
 
-  /** Reserve a truck for a load (or a load for a truck). */
-  acceptMatch(
+  // --- Marketplace: open browse (SRS §18–§22) ----------------------------
+  /** Every truck currently listed as available, across all owners. */
+  marketplaceTrucks(token: string): Promise<{ ok: true; trucks: ApiTruck[] }> {
+    return request('/api/marketplace/trucks', { token });
+  },
+
+  marketplaceTruck(token: string, id: string): Promise<{ ok: true; truck: ApiTruck }> {
+    return request(`/api/marketplace/trucks/${encodeURIComponent(id)}`, { token });
+  },
+
+  /** Every load currently posted, across all owners. */
+  marketplaceCargo(token: string): Promise<{ ok: true; cargo: ApiCargo[] }> {
+    return request('/api/marketplace/cargo', { token });
+  },
+
+  marketplaceCargoItem(token: string, id: string): Promise<{ ok: true; cargo: ApiCargo }> {
+    return request(`/api/marketplace/cargo/${encodeURIComponent(id)}`, { token });
+  },
+
+  // --- Bookings (SRS §18–§22) --------------------------------------------
+  bookings(token: string): Promise<{ ok: true; bookings: ApiBooking[] }> {
+    return request('/api/bookings', { token });
+  },
+
+  /** Ask the other party to reserve their truck/load for you. */
+  requestBooking(
     token: string,
-    input: { truckId: string; cargoId: string },
-  ): Promise<{ ok: true; truck: ApiTruck; cargo: ApiCargo }> {
-    return request('/api/matches/accept', { method: 'POST', body: input, token });
+    input: { truckId: string; cargoId: string; price?: number; message?: string },
+  ): Promise<{ ok: true; booking: ApiBooking; truck: ApiTruck; cargo: ApiCargo }> {
+    return request('/api/bookings', { method: 'POST', body: input, token });
+  },
+
+  acceptBooking(
+    token: string,
+    id: string,
+  ): Promise<{ ok: true; booking: ApiBooking; truck: ApiTruck; cargo: ApiCargo }> {
+    return request(`/api/bookings/${encodeURIComponent(id)}/accept`, { method: 'POST', token });
+  },
+
+  rejectBooking(
+    token: string,
+    id: string,
+  ): Promise<{ ok: true; booking: ApiBooking }> {
+    return request(`/api/bookings/${encodeURIComponent(id)}/reject`, { method: 'POST', token });
+  },
+
+  cancelBooking(
+    token: string,
+    id: string,
+  ): Promise<{ ok: true; booking: ApiBooking; truck: ApiTruck; cargo: ApiCargo }> {
+    return request(`/api/bookings/${encodeURIComponent(id)}/cancel`, { method: 'POST', token });
   },
 };

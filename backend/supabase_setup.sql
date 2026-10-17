@@ -8,11 +8,13 @@
 --   2. Go to "SQL Editor" -> "New query".
 --   3. Paste this ENTIRE file and click "Run".
 --
--- This file is the three canonical migration files concatenated in the correct
+-- This file is the five canonical migration files concatenated in the correct
 -- order, with NO changes to their behaviour:
---     1) supabase_schema.sql      (users, api_tokens, shipments, shipment_events)
---     2) supabase_marketplace.sql (user roles, locations, trucks, cargo)
---     3) supabase_bookings.sql    (match booking links)
+--     1) supabase_schema.sql          (users, api_tokens, shipments, shipment_events)
+--     2) supabase_marketplace.sql     (user roles, locations, trucks, cargo)
+--     3) supabase_bookings.sql        (match booking links)
+--     4) supabase_shipment_details.sql (shipment cargo/planning detail columns)
+--     5) supabase_booking_requests.sql (bookings, pricing, driver + RPCs)
 --
 -- It is fully IDEMPOTENT: safe to run again on a project that already has it.
 --
@@ -26,7 +28,7 @@
 
 
 -- ============================================================================
--- PART 1 / 3 — CORE SCHEMA  (from supabase_schema.sql)
+-- PART 1 / 5 — CORE SCHEMA  (from supabase_schema.sql)
 -- ============================================================================
 
 create extension if not exists pgcrypto;
@@ -67,6 +69,19 @@ create unique index if not exists api_tokens_hash_unique
 
 create index if not exists api_tokens_user_idx
   on public.api_tokens (user_id);
+
+-- ---------------------------------------------------------------------------
+-- password_reset_tokens — single-use tokens for the forgot-password flow.
+--   email: normalized (trimmed + lowercased) email OR phone, matching the
+--          identifier the account signed up with.
+--   token: SHA-256 hash of the one-time token; the raw token only ever exists
+--          in the reset link sent to the user.
+-- ---------------------------------------------------------------------------
+create table if not exists public.password_reset_tokens (
+  email      text primary key,
+  token      text not null,
+  created_at timestamptz not null default now()
+);
 
 -- ---------------------------------------------------------------------------
 -- shipments — one row per freight shipment.
@@ -149,6 +164,7 @@ create trigger shipments_set_updated_at
 -- ---------------------------------------------------------------------------
 alter table public.users          enable row level security;
 alter table public.api_tokens     enable row level security;
+alter table public.password_reset_tokens enable row level security;
 alter table public.shipments      enable row level security;
 alter table public.shipment_events enable row level security;
 
@@ -156,7 +172,7 @@ alter table public.shipment_events enable row level security;
 
 
 -- ============================================================================
--- PART 2 / 3 — MARKETPLACE SCHEMA  (from supabase_marketplace.sql)
+-- PART 2 / 5 — MARKETPLACE SCHEMA  (from supabase_marketplace.sql)
 -- ============================================================================
 
 create extension if not exists pgcrypto;
@@ -300,7 +316,7 @@ alter table public.cargo     enable row level security;
 
 
 -- ============================================================================
--- PART 3 / 3 — BOOKING LINKS  (from supabase_bookings.sql)
+-- PART 3 / 5 — BOOKING LINKS  (from supabase_bookings.sql)
 -- ============================================================================
 -- Accepting a match (SRS §22) reserves both sides: the load is marked booked
 -- and the truck is taken off the market. Each side stores a reference to its
@@ -325,9 +341,283 @@ create index if not exists trucks_matched_cargo_idx on public.trucks (matched_ca
 
 
 -- ============================================================================
+-- PART 4 / 5 — SHIPMENT DETAILS  (from supabase_shipment_details.sql)
+-- ============================================================================
+-- Cargo + planning detail columns on public.shipments, plus an optional link to
+-- the truck hauling the load. All nullable and idempotent.
+
+alter table public.shipments add column if not exists cargo_type text;
+alter table public.shipments add column if not exists cargo_description text;
+alter table public.shipments add column if not exists weight_tons numeric(10,2);
+alter table public.shipments add column if not exists dimensions text;
+alter table public.shipments add column if not exists pickup_date date;
+alter table public.shipments add column if not exists delivery_deadline date;
+alter table public.shipments add column if not exists booking_reference text;
+
+alter table public.shipments
+  add column if not exists assigned_truck_id uuid
+  references public.trucks (id) on delete set null;
+
+do $$
+begin
+  alter table public.shipments
+    add constraint shipments_weight_tons_check check (weight_tons is null or weight_tons > 0);
+exception
+  when duplicate_object then null;
+end $$;
+
+create index if not exists shipments_assigned_truck_idx
+  on public.shipments (assigned_truck_id);
+
+
+-- ============================================================================
+-- PART 5 / 5 — BOOKING REQUESTS  (from supabase_booking_requests.sql)
+-- ============================================================================
+-- Explicit request → accept / reject booking lifecycle on a real table, plus
+-- the pricing (trucks.rate_per_ton, cargo.currency) and driver (driver_name /
+-- driver_phone) fields. Partial unique indexes prevent duplicate/conflicting
+-- bookings; accept_booking() / cancel_booking() do the multi-row change in one
+-- transaction.
+
+alter table public.trucks add column if not exists driver_name  text;
+alter table public.trucks add column if not exists driver_phone text;
+alter table public.trucks add column if not exists rate_per_ton numeric(15, 2);
+
+alter table public.cargo add column if not exists currency text not null default 'TZS';
+
+create table if not exists public.bookings (
+  id           uuid primary key default gen_random_uuid(),
+  cargo_id     uuid not null references public.cargo (id) on delete cascade,
+  truck_id     uuid not null references public.trucks (id) on delete cascade,
+  requester_id uuid not null references public.users (id) on delete cascade,
+  responder_id uuid not null references public.users (id) on delete cascade,
+  status       text not null default 'pending'
+               check (status in ('pending', 'accepted', 'rejected', 'cancelled')),
+  price        numeric(15, 2),
+  currency     text not null default 'TZS',
+  message      text,
+  decided_by   uuid references public.users (id) on delete set null,
+  requested_at timestamptz not null default now(),
+  decided_at   timestamptz,
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now()
+);
+
+create index if not exists bookings_cargo_idx     on public.bookings (cargo_id);
+create index if not exists bookings_truck_idx     on public.bookings (truck_id);
+create index if not exists bookings_requester_idx on public.bookings (requester_id);
+create index if not exists bookings_responder_idx on public.bookings (responder_id);
+create index if not exists bookings_status_idx    on public.bookings (status);
+
+create unique index if not exists bookings_active_pair_unique
+  on public.bookings (cargo_id, truck_id) where status in ('pending', 'accepted');
+create unique index if not exists bookings_active_cargo_unique
+  on public.bookings (cargo_id) where status = 'accepted';
+create unique index if not exists bookings_active_truck_unique
+  on public.bookings (truck_id) where status = 'accepted';
+
+drop trigger if exists bookings_set_updated_at on public.bookings;
+create trigger bookings_set_updated_at
+  before update on public.bookings
+  for each row execute function public.set_updated_at();
+
+alter table public.bookings enable row level security;
+
+create or replace function public.accept_booking(p_booking uuid, p_user uuid)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_booking  public.bookings;
+  v_cargo    public.cargo;
+  v_truck    public.trucks;
+  v_cargo_id uuid;
+  v_truck_id uuid;
+begin
+  -- Peek at the request (no lock) only to learn which load + truck it needs.
+  select * into v_booking from public.bookings where id = p_booking;
+  if not found then
+    return jsonb_build_object('ok', false, 'error', 'not_found', 'field', 'booking',
+      'message', 'This booking request no longer exists');
+  end if;
+
+  v_cargo_id := v_booking.cargo_id;
+  v_truck_id := v_booking.truck_id;
+
+  -- Lock the shared rows FIRST, always in cargo -> truck -> booking order, so
+  -- two concurrent accepts/cancels can never deadlock on each other.
+  select * into v_cargo from public.cargo where id = v_cargo_id for update;
+  select * into v_truck from public.trucks where id = v_truck_id for update;
+
+  if v_cargo.id is null or v_truck.id is null then
+    return jsonb_build_object('ok', false, 'error', 'not_found', 'field', 'booking',
+      'message', 'This booking request no longer exists');
+  end if;
+
+  select * into v_booking from public.bookings where id = p_booking for update;
+  if not found then
+    return jsonb_build_object('ok', false, 'error', 'not_found', 'field', 'booking',
+      'message', 'This booking request no longer exists');
+  end if;
+
+  if p_user <> v_booking.responder_id then
+    return jsonb_build_object('ok', false, 'error', 'forbidden', 'field', 'booking',
+      'message', 'Only the other party can respond to this request');
+  end if;
+
+  if v_booking.status <> 'pending' then
+    return jsonb_build_object('ok', false, 'error', 'conflict', 'field', 'booking',
+      'message', 'This request has already been answered');
+  end if;
+
+  if v_cargo.status <> 'posted' then
+    return jsonb_build_object('ok', false, 'error', 'conflict', 'field', 'cargo',
+      'message', 'That load has just been booked');
+  end if;
+
+  if v_truck.status <> 'available' then
+    return jsonb_build_object('ok', false, 'error', 'conflict', 'field', 'truck',
+      'message', 'That truck has just been booked');
+  end if;
+
+  update public.bookings
+     set status = 'accepted', decided_by = p_user, decided_at = now()
+   where id = p_booking;
+
+  update public.cargo
+     set status = 'booked', matched_truck_id = v_truck_id, matched_at = now()
+   where id = v_cargo_id;
+
+  update public.trucks
+     set status = 'booked', matched_cargo_id = v_cargo_id, matched_at = now()
+   where id = v_truck_id;
+
+  update public.bookings
+     set status = 'rejected', decided_by = p_user, decided_at = now()
+   where id <> p_booking
+     and status = 'pending'
+     and (cargo_id = v_cargo_id or truck_id = v_truck_id);
+
+  select * into v_booking from public.bookings where id = p_booking;
+  select * into v_cargo   from public.cargo   where id = v_cargo_id;
+  select * into v_truck   from public.trucks  where id = v_truck_id;
+
+  return jsonb_build_object(
+    'ok', true,
+    'booking', to_jsonb(v_booking),
+    'cargo', to_jsonb(v_cargo),
+    'truck', to_jsonb(v_truck)
+  );
+end;
+$$;
+
+create or replace function public.cancel_booking(p_booking uuid, p_user uuid)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_booking  public.bookings;
+  v_cargo    public.cargo;
+  v_truck    public.trucks;
+  v_cargo_id uuid;
+  v_truck_id uuid;
+begin
+  -- Peek at the request (no lock) only to learn which load + truck it needs.
+  select * into v_booking from public.bookings where id = p_booking;
+  if not found then
+    return jsonb_build_object('ok', false, 'error', 'not_found', 'field', 'booking',
+      'message', 'This booking no longer exists');
+  end if;
+
+  v_cargo_id := v_booking.cargo_id;
+  v_truck_id := v_booking.truck_id;
+
+  -- Lock in the same cargo -> truck -> booking order as accept_booking() so the
+  -- two functions can never deadlock when they fire at the same time.
+  select * into v_cargo from public.cargo where id = v_cargo_id for update;
+  select * into v_truck from public.trucks where id = v_truck_id for update;
+
+  select * into v_booking from public.bookings where id = p_booking for update;
+  if not found then
+    return jsonb_build_object('ok', false, 'error', 'not_found', 'field', 'booking',
+      'message', 'This booking no longer exists');
+  end if;
+
+  if p_user <> v_booking.requester_id and p_user <> v_booking.responder_id then
+    return jsonb_build_object('ok', false, 'error', 'forbidden', 'field', 'booking',
+      'message', 'You can only cancel your own bookings');
+  end if;
+
+  if v_booking.status in ('cancelled', 'rejected') then
+    return jsonb_build_object('ok', false, 'error', 'conflict', 'field', 'booking',
+      'message', 'This booking is already closed');
+  end if;
+
+  if v_booking.status = 'accepted' then
+    update public.cargo
+       set status = 'posted', matched_truck_id = null, matched_at = null
+     where id = v_cargo_id and matched_truck_id = v_truck_id;
+
+    update public.trucks
+       set status = 'available', matched_cargo_id = null, matched_at = null
+     where id = v_truck_id and matched_cargo_id = v_cargo_id;
+  end if;
+
+  update public.bookings
+     set status = 'cancelled', decided_by = p_user, decided_at = now()
+   where id = p_booking;
+
+  select * into v_booking from public.bookings where id = p_booking;
+  select * into v_cargo   from public.cargo   where id = v_cargo_id;
+  select * into v_truck   from public.trucks  where id = v_truck_id;
+
+  return jsonb_build_object(
+    'ok', true,
+    'booking', to_jsonb(v_booking),
+    'cargo', to_jsonb(v_cargo),
+    'truck', to_jsonb(v_truck)
+  );
+end;
+$$;
+
+
+-- ---------------------------------------------------------------------------
+-- Lock the RPCs down. accept_booking()/cancel_booking() are SECURITY DEFINER
+-- and TRUST the p_user argument, so they must NOT be callable by the public,
+-- anon or authenticated roles (PostgREST grants EXECUTE to PUBLIC by default,
+-- which would let anyone POST /rest/v1/rpc/accept_booking with a forged user).
+-- Only the backend's service_role key may execute them.
+-- ---------------------------------------------------------------------------
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'service_role') then
+    revoke execute on function public.accept_booking(uuid, uuid) from public;
+    revoke execute on function public.cancel_booking(uuid, uuid) from public;
+
+    if exists (select 1 from pg_roles where rolname = 'anon') then
+      revoke execute on function public.accept_booking(uuid, uuid) from anon;
+      revoke execute on function public.cancel_booking(uuid, uuid) from anon;
+    end if;
+
+    if exists (select 1 from pg_roles where rolname = 'authenticated') then
+      revoke execute on function public.accept_booking(uuid, uuid) from authenticated;
+      revoke execute on function public.cancel_booking(uuid, uuid) from authenticated;
+    end if;
+
+    grant execute on function public.accept_booking(uuid, uuid) to service_role;
+    grant execute on function public.cancel_booking(uuid, uuid) to service_role;
+  end if;
+end $$;
+
+
+-- ============================================================================
 -- DONE. Expected tables:
 --   public.users, public.api_tokens, public.shipments, public.shipment_events,
---   public.locations, public.trucks, public.cargo
+--   public.locations, public.trucks, public.cargo, public.bookings
 -- Verify in the Dashboard: Table Editor, or run:
 --   select table_name from information_schema.tables
 --   where table_schema = 'public' order by table_name;

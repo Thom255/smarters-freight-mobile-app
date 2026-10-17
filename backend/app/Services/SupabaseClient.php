@@ -2,9 +2,11 @@
 
 namespace App\Services;
 
+use App\Exceptions\DataStoreUnavailable;
 use Illuminate\Http\Client\ConnectionException;
+use Illuminate\Http\Client\Pool;
+use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Http;
-use RuntimeException;
 
 /**
  * Minimal Supabase REST (PostgREST) client.
@@ -23,10 +25,13 @@ class SupabaseClient
      * cut the call short and (for idempotent methods) retry once.
      */
     private const CONNECT_TIMEOUT = 5;   // seconds to open the TCP/TLS connection
+
     private const TIMEOUT = 10;          // seconds to finish the request
+
     private const RETRY_TIMES = 2;       // attempts for GET/HEAD/DELETE
 
     private string $baseUrl;
+
     private string $serviceKey;
 
     public function __construct()
@@ -35,8 +40,9 @@ class SupabaseClient
         $this->serviceKey = (string) config('supabase.service_key');
 
         if ($this->baseUrl === '' || $this->serviceKey === '') {
-            throw new RuntimeException(
-                'Supabase is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_KEY in backend/.env'
+            throw new DataStoreUnavailable(
+                'Supabase is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_KEY in backend/.env',
+                503
             );
         }
     }
@@ -89,10 +95,28 @@ class SupabaseClient
      */
     public function update(string $table, string $column, string $equals, array $values): array
     {
+        return $this->updateMatching($table, [$column => $equals], $values);
+    }
+
+    /**
+     * PATCH rows that match EVERY filter (PostgREST combines them with AND),
+     * e.g. ['id' => 'eq.<uuid>', 'status' => 'eq.available'].
+     *
+     * Returns the updated representations — an empty array means no row
+     * matched the predicate. Callers use that as a compare-and-set: the
+     * database only applies the update when the row is still in the expected
+     * state, so two concurrent requests cannot both win.
+     *
+     * @param  array<string, string>  $filters
+     * @param  array<string, mixed>  $values
+     * @return array<int, array<string, mixed>>
+     */
+    public function updateMatching(string $table, array $filters, array $values): array
+    {
         return $this->request(
             'PATCH',
             $table,
-            [$column => $equals],
+            $filters,
             $values,
             ['Prefer' => 'return=representation']
         );
@@ -106,6 +130,60 @@ class SupabaseClient
     public function delete(string $table, string $column, string $equals, array $query = []): void
     {
         $this->request('DELETE', $table, array_merge([$column => $equals], $query));
+    }
+
+    /**
+     * Several independent GET reads issued at the same time.
+     *
+     * A single PostgREST round trip costs ~1s from this host, and a request
+     * like the dashboard needs five of them. Running them concurrently turns
+     * that wall clock from "sum of round trips" into "the slowest one".
+     *
+     * @param  array<string, array{table: string, query?: array<string, string>}>  $reads
+     * @return array<string, array<int, array<string, mixed>>>
+     */
+    public function selectMany(array $reads): array
+    {
+        if ($reads === []) {
+            return [];
+        }
+
+        $responses = Http::pool(function (Pool $pool) use ($reads): void {
+            foreach ($reads as $key => $read) {
+                $pool->as($key)
+                    ->withHeaders($this->headers())
+                    ->withOptions(['http_errors' => false])
+                    ->connectTimeout(self::CONNECT_TIMEOUT)
+                    ->timeout(self::TIMEOUT)
+                    ->get($this->url($read['table']), $read['query'] ?? []);
+            }
+        });
+
+        $decoded = [];
+        foreach ($reads as $key => $read) {
+            $response = $responses[$key] ?? null;
+
+            if ($response instanceof ConnectionException) {
+                throw new DataStoreUnavailable('Cannot reach Supabase REST API: '.$response->getMessage(), 503, $response);
+            }
+
+            if ($response instanceof \Throwable) {
+                throw $response;
+            }
+
+            if (! $response instanceof Response) {
+                throw new DataStoreUnavailable("Supabase pool returned no response for '{$read['table']}'", 502);
+            }
+
+            if ($response->failed()) {
+                throw $this->toException($read['table'], $response);
+            }
+
+            $rows = $response->json();
+            $decoded[$key] = is_array($rows) ? $rows : [];
+        }
+
+        return $decoded;
     }
 
     /**
@@ -129,6 +207,37 @@ class SupabaseClient
         $parts = explode('/', $contentRange);
 
         return isset($parts[1]) && is_numeric($parts[1]) ? (int) $parts[1] : 0;
+    }
+
+    /**
+     * Call a PostgREST database function: POST /rest/v1/rpc/{function}.
+     *
+     * Used for the transactional booking operations (accept/cancel), which
+     * mutate several rows at once — something the REST interface cannot do in
+     * a single round trip. The function returns a JSON object.
+     *
+     * @param  array<string, mixed>  $params
+     * @return array<string, mixed>
+     */
+    public function rpc(string $function, array $params = []): array
+    {
+        try {
+            $response = Http::withHeaders($this->headers())
+                ->withOptions(['http_errors' => false])
+                ->connectTimeout(self::CONNECT_TIMEOUT)
+                ->timeout(self::TIMEOUT)
+                ->post($this->baseUrl.'/rest/v1/rpc/'.rawurlencode($function), $params);
+        } catch (ConnectionException $e) {
+            throw new DataStoreUnavailable('Cannot reach Supabase REST API: '.$e->getMessage(), 503, $e);
+        }
+
+        if ($response->failed()) {
+            throw $this->toException($function, $response);
+        }
+
+        $decoded = $response->json();
+
+        return is_array($decoded) ? $decoded : [];
     }
 
     /**
@@ -161,11 +270,11 @@ class SupabaseClient
             }
 
             $pending = $pending->send($method, $this->url($table), array_filter([
-                    'query' => $query === [] ? null : $query,
-                    'json' => $body,
-                ], fn ($value) => $value !== null));
+                'query' => $query === [] ? null : $query,
+                'json' => $body,
+            ], fn ($value) => $value !== null));
         } catch (ConnectionException $e) {
-            throw new RuntimeException('Cannot reach Supabase REST API: '.$e->getMessage(), 503, $e);
+            throw new DataStoreUnavailable('Cannot reach Supabase REST API: '.$e->getMessage(), 503, $e);
         }
 
         if ($pending->failed()) {
@@ -192,7 +301,7 @@ class SupabaseClient
         ];
     }
 
-    private function toException(string $table, $response): RuntimeException
+    private function toException(string $table, $response): DataStoreUnavailable
     {
         $status = $response->status();
         $message = $response->json('message') ?? $response->json('error_description')
@@ -200,15 +309,17 @@ class SupabaseClient
 
         // Table missing → most likely the SQL file has not been run yet.
         if (str_contains((string) $message, 'relation') && str_contains((string) $message, 'does not exist')) {
-            return new RuntimeException(
+            return new DataStoreUnavailable(
                 "Supabase table missing for '{$table}'. Run supabase_schema.sql in the Supabase SQL Editor first.",
                 500
             );
         }
 
-        return new RuntimeException(
+        return new DataStoreUnavailable(
             "Supabase REST error ({$status}) on '{$table}': {$message}",
-            502
+            // Upstream 5xx is a gateway fault; anything else is a server-side
+            // misconfiguration (bad key, missing column, revoked permission).
+            $status >= 500 ? 502 : 500
         );
     }
 }

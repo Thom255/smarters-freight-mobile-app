@@ -52,9 +52,15 @@ Run these once, in order, in the Supabase SQL Editor:
    `locations`, `trucks`, `cargo` (SRS §14–§17).
 3. **`supabase_bookings.sql`** — the `cargo.matched_truck_id` /
    `trucks.matched_cargo_id` links that keep a booked match visible (SRS §22).
+4. **`supabase_shipment_details.sql`** — richer shipment fields (`cargo_type`,
+   `weight_tons`, dates, `assigned_truck_id`, …).
+5. **`supabase_booking_requests.sql`** — `trucks.driver_name`/`driver_phone`/
+   `rate_per_ton`, `cargo.currency`, the `bookings` table with partial unique
+   indexes, and the `accept_booking`/`cancel_booking` RPCs.
 
-> If an API call fails with *"Run supabase_schema.sql in the Supabase SQL
-> Editor first"*, the tables are missing.
+> `supabase_setup.sql` runs all five in order in one go. If an API call fails
+> with *"Run supabase_schema.sql in the Supabase SQL Editor first"*, the tables
+> are missing.
 
 ## API reference
 
@@ -86,23 +92,41 @@ Failures are `{ "ok": false, "field": "<form|name|identifier|password|confirm>",
 | Method | Path | Success |
 | --- | --- | --- |
 | GET | `/api/trucks` | `{ ok, trucks }` — the caller's fleet |
-| POST | `/api/trucks` | `{ ok, truck }` — body `registrationNumber, truckType, capacityTons, currentLocation, availabilityDate` |
+| POST | `/api/trucks` | `{ ok, truck }` — body `registrationNumber, truckType, capacityTons, currentLocation, availabilityDate, driverName?, driverPhone?, ratePerTon?` |
 | GET | `/api/trucks/{id}` | `{ ok, truck }` — owner only |
-| PATCH | `/api/trucks/{id}` | `{ ok, truck }` — body `status?, currentLocation?, availabilityDate?` |
+| PATCH | `/api/trucks/{id}` | `{ ok, truck }` — body `status?, currentLocation?, availabilityDate?, driverName?, driverPhone?, ratePerTon?` |
 | GET | `/api/cargo` | `{ ok, cargo }` — the caller's loads |
-| POST | `/api/cargo` | `{ ok, cargo }` — body `cargoType, weightTons, pickupLocation, destination, pickupDate, …` |
+| POST | `/api/cargo` | `{ ok, cargo }` — body `cargoType, weightTons, pickupLocation, destination, pickupDate, currency?, …` |
 | GET | `/api/cargo/{id}` | `{ ok, cargo }` — owner only |
-| PATCH | `/api/cargo/{id}` | `{ ok, cargo }` — body `status?, pickupDate?, budget?, …` |
+| PATCH | `/api/cargo/{id}` | `{ ok, cargo }` — body `status?, pickupDate?, budget?, currency?` |
 | GET | `/api/matches` | `{ ok, role, matches }` — role-aware best matches |
 | GET | `/api/matches/cargo/{id}` | `{ ok, cargo, matches }` — trucks for one of my loads |
 | GET | `/api/matches/truck/{id}` | `{ ok, truck, matches }` — loads for one of my trucks |
-| POST | `/api/matches/accept` | `{ ok, truck, cargo }` — body `truckId, cargoId`; books both sides |
+| GET | `/api/marketplace/trucks` | `{ ok, trucks }` — every available truck, any owner |
+| GET | `/api/marketplace/trucks/{id}` | `{ ok, truck }` — open browse detail |
+| GET | `/api/marketplace/cargo` | `{ ok, cargo }` — every posted load, any owner |
+| GET | `/api/marketplace/cargo/{id}` | `{ ok, cargo }` — open browse detail |
+
+### Bookings (SRS §18–§22)
+
+| Method | Path | Success |
+| --- | --- | --- |
+| GET | `/api/bookings` | `{ ok, bookings }` — incoming + outgoing for the caller |
+| POST | `/api/bookings` | **201** `{ ok, booking, truck, cargo }` — body `truckId, cargoId, price?, message?` |
+| POST | `/api/bookings/{id}/accept` | `{ ok, booking, truck, cargo }` — responder only |
+| POST | `/api/bookings/{id}/reject` | `{ ok, booking }` — responder only |
+| POST | `/api/bookings/{id}/cancel` | `{ ok, booking, truck, cargo }` — either party |
 
 Scores follow the SRS weighting (route 30, capacity 25, date 20, location 15,
-availability 10). Accepting a match is allowed for the owner of either side;
-it sets the load and truck to `booked` and records the counterpart link.
-Finishing a load (`delivered`/`completed`/`cancelled`) or freeing a truck
-(`available`/`inactive`/`maintenance`) releases the other side automatically.
+availability 10). A booking request is created by the owner of either side and
+must be **accepted** by the other party (`pending → accepted`), or declined
+(`→ rejected`); either side may `cancel`. Accepting auto-declines competing
+pending requests and sets the load and truck to `booked`, recording the
+counterpart link. The `accept_booking`/`cancel_booking` Postgres RPCs enforce
+this atomically, backed by partial unique indexes (one active booking per
+pair, per load, per truck). Finishing a load (`delivered`/`completed`/
+`cancelled`) or freeing a truck (`available`/`inactive`/`maintenance`) also
+cancels its active bookings.
 
 Tokens expire after 30 days; a rejected/expired token returns **401**.
 

@@ -1,13 +1,5 @@
 import { router, type Href } from 'expo-router';
-import { useState } from 'react';
-import {
-  ActivityIndicator,
-  Modal,
-  Pressable,
-  StyleSheet,
-  Text,
-  View,
-} from 'react-native';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import {
   Badge,
@@ -15,44 +7,37 @@ import {
   Card,
   FadeInView,
   Icon,
-  Input,
   Screen,
+  SkeletonList,
   type IconName,
 } from '@/components/ui';
 import { Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/use-auth';
 import { useDashboard } from '@/hooks/use-dashboard';
-import { useCreateShipment } from '@/hooks/use-shipments';
 import { useTheme } from '@/hooks/use-theme';
+import type { DashboardAlertTone, DashboardPayload } from '@/lib/api';
 import { shipmentStatusLabel, SHIPMENT_STATUS_TONE } from '@/lib/shipments';
 import { roleLabel } from '@/lib/marketplace';
+
+type Metric = {
+  key: string;
+  label: string;
+  value: number;
+  icon: IconName;
+};
 
 export default function DashboardScreen() {
   const theme = useTheme();
   const { user } = useAuth();
-  const { data, loading, error, reload } = useDashboard();
-  const [composerOpen, setComposerOpen] = useState(false);
+  const { data, loading, refreshing, error, reload } = useDashboard();
 
   const role = user?.role ?? 'cargo_owner';
   const isTruckOwner = role === 'truck_owner';
-  const marketplace = data?.marketplace;
 
   const displayName = user?.name?.split(' ')[0] ?? 'SMARTERS FREIGHT';
   const subtitle = user?.name ? `${roleLabel(role)} · ${user.identifier}` : 'Signed in';
 
-  const stats = isTruckOwner
-    ? [
-        { label: 'Trucks', value: marketplace?.trucks ?? 0, icon: 'truck' as IconName },
-        { label: 'Available', value: marketplace?.availableTrucks ?? 0, icon: 'checkSeal' as IconName },
-        { label: 'Matches', value: marketplace?.matches ?? 0, icon: 'swap' as IconName },
-      ]
-    : [
-        { label: 'My loads', value: marketplace?.cargo ?? 0, icon: 'box' as IconName },
-        { label: 'Posted', value: marketplace?.postedCargo ?? 0, icon: 'route' as IconName },
-        { label: 'Matches', value: marketplace?.matches ?? 0, icon: 'swap' as IconName },
-      ];
-
-  const quickActions: { label: string; icon: IconName; route: string }[] = isTruckOwner
+  const roleActions: { label: string; icon: IconName; route: string }[] = isTruckOwner
     ? [
         { label: 'Add truck', icon: 'truck', route: '/trucks' },
         { label: 'Find loads', icon: 'swap', route: '/matches' },
@@ -62,11 +47,30 @@ export default function DashboardScreen() {
         { label: 'Find trucks', icon: 'swap', route: '/matches' },
       ];
 
-  const active = data?.activeShipment ?? null;
+  const quickActions: { label: string; icon: IconName; route: string }[] = [
+    { label: 'New shipment', icon: 'plus', route: '/shipments/new' },
+    ...roleActions,
+  ];
+
+  const metrics = data ? buildMetrics(data, isTruckOwner) : [];
+  const alerts = data?.alerts ?? [];
+  const upcoming = data?.upcomingDeliveries ?? [];
   const activity = data?.recentActivity ?? [];
 
+  const hasNoData =
+    !!data &&
+    data.stats.shipments === 0 &&
+    data.loads.total === 0 &&
+    data.fleet.total === 0 &&
+    upcoming.length === 0 &&
+    activity.length === 0;
+
   return (
-    <Screen scroll tabBar>
+    <Screen
+      scroll
+      tabBar
+      refreshing={refreshing}
+      onRefresh={() => void reload()}>
       {/* Hero */}
       <View style={[styles.hero, { backgroundColor: theme.brandNavy }]}>
         <View style={styles.heroTop}>
@@ -83,8 +87,7 @@ export default function DashboardScreen() {
           </View>
 
           <View style={styles.heroActions}>
-            <View
-              style={[styles.iconButton, { backgroundColor: theme.brandNavySurface }]}>
+            <View style={[styles.iconButton, { backgroundColor: theme.brandNavySurface }]}>
               <Icon name="bell" size={20} color={theme.accent} />
             </View>
 
@@ -101,29 +104,13 @@ export default function DashboardScreen() {
             </Pressable>
           </View>
         </View>
-
-        <View style={styles.stats}>
-          {stats.map((stat) => (
-            <View
-              key={stat.label}
-              style={[styles.statTile, { backgroundColor: theme.brandNavySurface }]}>
-              <Icon name={stat.icon} size={18} color={theme.accent} />
-              <Text style={[theme.typography.title, { color: theme.onBrand }]}>
-                {stat.value}
-              </Text>
-              <Text style={[theme.typography.caption, { color: theme.onBrandMuted }]}>
-                {stat.label}
-              </Text>
-            </View>
-          ))}
-        </View>
       </View>
 
       <View style={styles.body}>
-        {error ? (
+        {error && !data ? (
           <Card>
             <View style={styles.emptyState}>
-              <View style={[styles.emptyIcon, { backgroundColor: theme.primarySubtle }]}>
+              <View style={[styles.emptyIcon, { backgroundColor: theme.dangerSubtle }]}>
                 <Icon name="alert" size={26} color={theme.danger} />
               </View>
               <Text style={[theme.typography.subheading, { color: theme.text }]}>
@@ -132,32 +119,48 @@ export default function DashboardScreen() {
               <Text
                 style={[
                   theme.typography.caption,
-                  styles.emptyText,
+                  styles.centerText,
                   { color: theme.textSecondary },
                 ]}>
                 {error}
               </Text>
-              <Button fullWidth={false} onPress={() => reload()}>
+              <Button fullWidth={false} onPress={() => void reload()}>
                 Try again
               </Button>
             </View>
           </Card>
         ) : loading && !data ? (
-          <Card>
-            <View style={styles.emptyState}>
-              <ActivityIndicator color={theme.primary} />
-              <Text
-                style={[
-                  theme.typography.caption,
-                  { color: theme.textSecondary },
-                  styles.emptyText,
-                ]}>
-                Loading your shipments…
-              </Text>
-            </View>
-          </Card>
+          <SkeletonList count={4} />
         ) : (
           <>
+            {error ? (
+              <FadeInView index={0}>
+                <Card>
+                  <View style={styles.row}>
+                    <View style={[styles.roundIcon, { backgroundColor: theme.dangerSubtle }]}>
+                      <Icon name="alert" size={18} color={theme.danger} />
+                    </View>
+                    <View style={styles.flex}>
+                      <Text style={[theme.typography.bodyMedium, { color: theme.text }]}>
+                        Couldn&apos;t refresh
+                      </Text>
+                      <Text style={[theme.typography.caption, { color: theme.textSecondary }]}>
+                        {error}
+                      </Text>
+                    </View>
+                    <Pressable
+                      onPress={() => void reload()}
+                      hitSlop={Spacing.two}
+                      accessibilityRole="button">
+                      <Text style={[theme.typography.label, { color: theme.primary }]}>
+                        Retry
+                      </Text>
+                    </Pressable>
+                  </View>
+                </Card>
+              </FadeInView>
+            ) : null}
+
             <FadeInView index={0}>
               <View style={styles.quickActions}>
                 {quickActions.map((action) => (
@@ -173,7 +176,7 @@ export default function DashboardScreen() {
                       },
                       pressed && styles.pressed,
                     ]}>
-                    <View style={[styles.activityIcon, { backgroundColor: theme.primarySubtle }]}>
+                    <View style={[styles.roundIcon, { backgroundColor: theme.primarySubtle }]}>
                       <Icon name={action.icon} size={18} color={theme.primary} />
                     </View>
                     <Text style={[theme.typography.bodyMedium, { color: theme.text }]}>
@@ -184,135 +187,224 @@ export default function DashboardScreen() {
               </View>
             </FadeInView>
 
+            {hasNoData ? (
+              <FadeInView index={1}>
+                <Card>
+                  <View style={styles.emptyState}>
+                    <View style={[styles.emptyIcon, { backgroundColor: theme.primarySubtle }]}>
+                      <Icon name="grid" size={26} color={theme.primary} />
+                    </View>
+                    <Text style={[theme.typography.subheading, { color: theme.text }]}>
+                      Your dashboard is ready
+                    </Text>
+                    <Text
+                      style={[
+                        theme.typography.caption,
+                        styles.centerText,
+                        { color: theme.textSecondary },
+                      ]}>
+                      {isTruckOwner
+                        ? 'Add a truck to start matching with posted loads.'
+                        : 'Create your first shipment to see live metrics here.'}
+                    </Text>
+                  </View>
+                </Card>
+              </FadeInView>
+            ) : null}
+
+            <SectionHeader title="Overview" />
+            <FadeInView index={2}>
+              <View style={styles.grid}>
+                {metrics.map((metric) => (
+                  <MetricTile key={metric.key} metric={metric} />
+                ))}
+              </View>
+            </FadeInView>
+
             <SectionHeader
-              title="Active shipment"
+              title="Alerts"
+              action={alerts.length > 0 ? `${alerts.length}` : undefined}
+            />
+            <FadeInView index={3}>
+              <Card>
+                {alerts.length > 0 ? (
+                  <View style={styles.list}>
+                    {alerts.map((alert) => (
+                      <View key={alert.id} style={styles.row}>
+                        <View
+                          style={[
+                            styles.roundIcon,
+                            { backgroundColor: alertSurface(theme, alert.tone) },
+                          ]}>
+                          <Icon
+                            name={alertIcon(alert.tone)}
+                            size={18}
+                            color={alertColor(theme, alert.tone)}
+                          />
+                        </View>
+                        <View style={styles.flex}>
+                          <Text style={[theme.typography.bodyMedium, { color: theme.text }]}>
+                            {alert.title}
+                          </Text>
+                          {alert.body ? (
+                            <Text
+                              style={[theme.typography.caption, { color: theme.textSecondary }]}>
+                              {alert.body}
+                            </Text>
+                          ) : null}
+                        </View>
+                      </View>
+                    ))}
+                  </View>
+                ) : (
+                  <EmptyRow
+                    icon="check"
+                    title="No alerts"
+                    body="Nothing needs your attention right now."
+                  />
+                )}
+              </Card>
+            </FadeInView>
+
+            <SectionHeader
+              title="Upcoming deliveries"
               action="See all"
               onAction={() => router.push('/shipments')}
             />
-
-            <Card>
-              {active ? (
-                <Pressable
-                  style={styles.activeRow}
-                  accessibilityRole="button"
-                  onPress={() =>
-                    router.push({
-                      pathname: '/shipments/[id]',
-                      params: { id: active.id },
-                    })
-                  }>
-                  <View
-                    style={[styles.activityIcon, { backgroundColor: theme.primarySubtle }]}>
-                    <Icon name="truck" size={18} color={theme.primary} />
+            <FadeInView index={4}>
+              <Card>
+                {upcoming.length > 0 ? (
+                  <View style={styles.list}>
+                    {upcoming.map((delivery) => (
+                      <Pressable
+                        key={delivery.id}
+                        style={styles.row}
+                        accessibilityRole="button"
+                        onPress={() =>
+                          router.push({
+                            pathname: '/shipments/[id]',
+                            params: { id: delivery.id },
+                          })
+                        }>
+                        <View
+                          style={[styles.roundIcon, { backgroundColor: theme.primarySubtle }]}>
+                          <Icon name="truck" size={18} color={theme.primary} />
+                        </View>
+                        <View style={styles.flex}>
+                          <Text
+                            style={[theme.typography.bodyMedium, { color: theme.text }]}
+                            numberOfLines={1}>
+                            {delivery.origin} → {delivery.destination}
+                          </Text>
+                          <Text
+                            style={[theme.typography.caption, { color: theme.textSecondary }]}
+                            numberOfLines={1}>
+                            {delivery.reference ?? 'Shipment'}
+                          </Text>
+                        </View>
+                        <Badge tone={SHIPMENT_STATUS_TONE[delivery.status] ?? 'neutral'}>
+                          {shipmentStatusLabel(delivery.status)}
+                        </Badge>
+                      </Pressable>
+                    ))}
                   </View>
-                  <View style={styles.flex}>
-                    <Text
-                      style={[theme.typography.bodyMedium, { color: theme.text }]}
-                      numberOfLines={1}>
-                      {active.origin} → {active.destination}
-                    </Text>
-                    <Text
-                      style={[theme.typography.caption, { color: theme.textSecondary }]}>
-                      {active.reference}
-                    </Text>
-                  </View>
-                  <Badge tone={SHIPMENT_STATUS_TONE[active.status] ?? 'neutral'}>
-                    {shipmentStatusLabel(active.status)}
-                  </Badge>
-                </Pressable>
-              ) : (
-                <View style={styles.emptyState}>
-                  <View
-                    style={[styles.emptyIcon, { backgroundColor: theme.primarySubtle }]}>
-                    <Icon name="truck" size={26} color={theme.primary} />
-                  </View>
-                  <Text style={[theme.typography.subheading, { color: theme.text }]}>
-                    No active shipment
-                  </Text>
-                  <Text
-                    style={[
-                      theme.typography.caption,
-                      styles.emptyText,
-                      { color: theme.textSecondary },
-                    ]}>
-                    Create a shipment to start tracking it from pickup to delivery.
-                  </Text>
-                  <Button
-                    fullWidth={false}
-                    onPress={() => setComposerOpen(true)}
-                    iconLeft={<Icon name="plus" size={18} color={theme.onPrimary} />}>
-                    New shipment
-                  </Button>
-                </View>
-              )}
-            </Card>
+                ) : (
+                  <EmptyRow
+                    icon="truck"
+                    title="No upcoming deliveries"
+                    body="Confirmed and in-transit shipments will appear here."
+                  />
+                )}
+              </Card>
+            </FadeInView>
 
-            <SectionHeader title="Recent activity" />
-
-            <Card>
-              {activity.length > 0 ? (
-                <View style={styles.activityList}>
-                  {activity.map((item) => (
-                    <View key={item.id} style={styles.activityRow}>
-                      <View
-                        style={[
-                          styles.activityIcon,
-                          { backgroundColor: theme.backgroundSelected },
-                        ]}>
-                        <Icon name="clock" size={18} color={theme.textSecondary} />
+            <SectionHeader
+              title="Recent activity"
+              action="See all"
+              onAction={() => router.push('/shipments')}
+            />
+            <FadeInView index={5}>
+              <Card>
+                {activity.length > 0 ? (
+                  <View style={styles.list}>
+                    {activity.map((item) => (
+                      <View key={item.id} style={styles.row}>
+                        <View
+                          style={[styles.roundIcon, { backgroundColor: theme.backgroundSelected }]}>
+                          <Icon name="clock" size={18} color={theme.textSecondary} />
+                        </View>
+                        <View style={styles.flex}>
+                          <Text style={[theme.typography.bodyMedium, { color: theme.text }]}>
+                            {item.title}
+                          </Text>
+                          <Text
+                            style={[theme.typography.caption, { color: theme.textSecondary }]}
+                            numberOfLines={1}>
+                            {item.body ?? item.reference ?? ''}
+                          </Text>
+                        </View>
                       </View>
-                      <View style={styles.flex}>
-                        <Text
-                          style={[theme.typography.bodyMedium, { color: theme.text }]}>
-                          {item.title}
-                        </Text>
-                        <Text
-                          style={[
-                            theme.typography.caption,
-                            { color: theme.textSecondary },
-                          ]}
-                          numberOfLines={1}>
-                          {item.body ?? item.reference ?? ''}
-                        </Text>
-                      </View>
-                    </View>
-                  ))}
-                </View>
-              ) : (
-                <View style={styles.activityRow}>
-                  <View
-                    style={[
-                      styles.activityIcon,
-                      { backgroundColor: theme.backgroundSelected },
-                    ]}>
-                    <Icon name="clock" size={18} color={theme.textSecondary} />
+                    ))}
                   </View>
-                  <View style={styles.flex}>
-                    <Text style={[theme.typography.bodyMedium, { color: theme.text }]}>
-                      Nothing here yet
-                    </Text>
-                    <Text
-                      style={[theme.typography.caption, { color: theme.textSecondary }]}>
-                      Updates about your deliveries will show up here.
-                    </Text>
-                  </View>
-                  <Badge tone="neutral">Soon</Badge>
-                </View>
-              )}
-            </Card>
+                ) : (
+                  <EmptyRow
+                    icon="clock"
+                    title="Nothing here yet"
+                    body="Updates about your deliveries will show up here."
+                  />
+                )}
+              </Card>
+            </FadeInView>
           </>
         )}
       </View>
-
-      <ShipmentComposer
-        visible={composerOpen}
-        onClose={() => setComposerOpen(false)}
-        onCreated={() => {
-          setComposerOpen(false);
-          void reload();
-        }}
-      />
     </Screen>
+  );
+}
+
+/** Role-aware metric tiles — every value comes straight from the backend. */
+function buildMetrics(data: DashboardPayload, isTruckOwner: boolean): Metric[] {
+  const shared: Metric[] = [
+    { key: 'shipments', label: 'Total shipments', value: data.stats.shipments, icon: 'box' },
+    { key: 'booked', label: 'Confirmed', value: data.stats.booked, icon: 'hourglass' },
+    { key: 'inTransit', label: 'In transit', value: data.stats.inTransit, icon: 'truck' },
+    { key: 'delivered', label: 'Delivered', value: data.stats.delivered, icon: 'checkSeal' },
+  ];
+
+  const specific: Metric[] = isTruckOwner
+    ? [
+        { key: 'fleet', label: 'Fleet size', value: data.fleet.total, icon: 'grid' },
+        { key: 'availableTrucks', label: 'Available trucks', value: data.fleet.available, icon: 'truck' },
+        { key: 'openLoads', label: 'Open loads', value: data.marketplace.postedCargo, icon: 'route' },
+        { key: 'bookings', label: 'Active bookings', value: data.bookings.active, icon: 'swap' },
+      ]
+    : [
+        { key: 'pendingLoads', label: 'Pending loads', value: data.loads.pending, icon: 'hourglass' },
+        { key: 'confirmedLoads', label: 'Confirmed loads', value: data.loads.confirmed, icon: 'check' },
+        { key: 'availableTrucks', label: 'Available trucks', value: data.marketplace.availableTrucks, icon: 'truck' },
+        { key: 'bookings', label: 'Active bookings', value: data.bookings.active, icon: 'swap' },
+      ];
+
+  return [...shared, ...specific];
+}
+
+function MetricTile({ metric }: { metric: Metric }) {
+  const theme = useTheme();
+
+  return (
+    <View
+      style={[
+        styles.metricTile,
+        { backgroundColor: theme.backgroundElement, borderColor: theme.border },
+      ]}>
+      <View style={[styles.roundIcon, { backgroundColor: theme.primarySubtle }]}>
+        <Icon name={metric.icon} size={18} color={theme.primary} />
+      </View>
+      <Text style={[theme.typography.title, { color: theme.text }]}>{metric.value}</Text>
+      <Text style={[theme.typography.caption, { color: theme.textSecondary }]} numberOfLines={1}>
+        {metric.label}
+      </Text>
+    </View>
   );
 }
 
@@ -331,129 +423,77 @@ function SectionHeader({
     <View style={styles.sectionHeader}>
       <Text style={[theme.typography.subheading, { color: theme.text }]}>{title}</Text>
       {action ? (
-        <Pressable
-          onPress={onAction}
-          disabled={!onAction}
-          hitSlop={Spacing.two}
-          accessibilityRole={onAction ? 'button' : undefined}>
-          <Text style={[theme.typography.label, { color: theme.primary }]}>{action}</Text>
-        </Pressable>
+        onAction ? (
+          <Pressable
+            onPress={onAction}
+            hitSlop={Spacing.two}
+            accessibilityRole="button">
+            <Text style={[theme.typography.label, { color: theme.primary }]}>{action}</Text>
+          </Pressable>
+        ) : (
+          <Badge tone="neutral">{action}</Badge>
+        )
       ) : null}
     </View>
   );
 }
 
-/** Modal form that POSTs a new shipment, then triggers a dashboard reload. */
-function ShipmentComposer({
-  visible,
-  onClose,
-  onCreated,
-}: {
-  visible: boolean;
-  onClose: () => void;
-  onCreated: () => void;
-}) {
+function EmptyRow({ icon, title, body }: { icon: IconName; title: string; body: string }) {
   const theme = useTheme();
-  const { createShipment, submitting } = useCreateShipment();
-  const [origin, setOrigin] = useState('');
-  const [destination, setDestination] = useState('');
-  const [notes, setNotes] = useState('');
-  const [errors, setErrors] = useState<Record<string, string | undefined>>({});
-
-  const clearError = (field: string) =>
-    setErrors((current) => ({ ...current, [field]: undefined }));
-
-  const submit = async () => {
-    if (submitting) return;
-    setErrors({});
-
-    const result = await createShipment({ origin, destination, notes });
-    if (!result.ok) {
-      setErrors({ [result.field]: result.message });
-      return;
-    }
-
-    setOrigin('');
-    setDestination('');
-    setNotes('');
-    onCreated();
-  };
 
   return (
-    <Modal
-      visible={visible}
-      animationType="slide"
-      transparent
-      onRequestClose={onClose}
-      statusBarTranslucent>
-      <View style={styles.modalBackdrop}>
-        <View style={[styles.modalSheet, { backgroundColor: theme.backgroundElement }]}>
-          <View style={styles.modalHeader}>
-            <Text style={[theme.typography.heading, { color: theme.text }]}>
-              New shipment
-            </Text>
-            <Pressable
-              onPress={onClose}
-              hitSlop={Spacing.two}
-              accessibilityRole="button"
-              accessibilityLabel="Close">
-              <Icon name="plus" size={22} color={theme.textSecondary} style={styles.modalCloseIcon} />
-            </Pressable>
-          </View>
-
-          <View style={styles.modalFields}>
-            <Input
-              label="Pickup location"
-              placeholder="Dar es Salaam, TZ"
-              value={origin}
-              onChangeText={(value) => {
-                setOrigin(value);
-                clearError('origin');
-              }}
-              error={errors.origin}
-              autoCapitalize="words"
-              returnKeyType="next"
-            />
-            <Input
-              label="Destination"
-              placeholder="Nairobi, KE"
-              value={destination}
-              onChangeText={(value) => {
-                setDestination(value);
-                clearError('destination');
-              }}
-              error={errors.destination}
-              autoCapitalize="words"
-              returnKeyType="next"
-            />
-            <Input
-              label="Notes (optional)"
-              placeholder="Fragile, keep upright…"
-              value={notes}
-              onChangeText={(value) => {
-                setNotes(value);
-                clearError('notes');
-              }}
-              error={errors.notes}
-              multiline
-            />
-            {errors.form ? (
-              <Text style={[theme.typography.caption, { color: theme.danger }]}>
-                {errors.form}
-              </Text>
-            ) : null}
-
-            <Button size="lg" loading={submitting} onPress={submit}>
-              Create shipment
-            </Button>
-            <Button variant="ghost" onPress={onClose} disabled={submitting}>
-              Cancel
-            </Button>
-          </View>
-        </View>
+    <View style={styles.row}>
+      <View style={[styles.roundIcon, { backgroundColor: theme.backgroundSelected }]}>
+        <Icon name={icon} size={18} color={theme.textSecondary} />
       </View>
-    </Modal>
+      <View style={styles.flex}>
+        <Text style={[theme.typography.bodyMedium, { color: theme.text }]}>{title}</Text>
+        <Text style={[theme.typography.caption, { color: theme.textSecondary }]}>{body}</Text>
+      </View>
+    </View>
   );
+}
+
+function alertIcon(tone: DashboardAlertTone): IconName {
+  switch (tone) {
+    case 'warning':
+    case 'danger':
+      return 'alert';
+    case 'success':
+      return 'check';
+    default:
+      return 'info';
+  }
+}
+
+function alertSurface(
+  theme: ReturnType<typeof useTheme>,
+  tone: DashboardAlertTone,
+): string {
+  switch (tone) {
+    case 'warning':
+    case 'danger':
+      return theme.warningSubtle;
+    case 'success':
+      return theme.successSubtle;
+    default:
+      return theme.infoSubtle;
+  }
+}
+
+function alertColor(
+  theme: ReturnType<typeof useTheme>,
+  tone: DashboardAlertTone,
+): string {
+  switch (tone) {
+    case 'warning':
+    case 'danger':
+      return theme.warning;
+    case 'success':
+      return theme.success;
+    default:
+      return theme.info;
+  }
 }
 
 const styles = StyleSheet.create({
@@ -478,24 +518,16 @@ const styles = StyleSheet.create({
     flex: 1,
     gap: Spacing.half,
   },
+  heroActions: {
+    flexDirection: 'row',
+    gap: Spacing.two,
+  },
   iconButton: {
     width: 44,
     height: 44,
     borderRadius: 22,
     alignItems: 'center',
     justifyContent: 'center',
-  },
-  stats: {
-    flexDirection: 'row',
-    gap: Spacing.two,
-  },
-  statTile: {
-    flex: 1,
-    borderRadius: 14,
-    paddingVertical: Spacing.three,
-    paddingHorizontal: Spacing.two,
-    alignItems: 'center',
-    gap: Spacing.half,
   },
   body: {
     padding: Spacing.three,
@@ -510,10 +542,13 @@ const styles = StyleSheet.create({
   },
   quickActions: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: Spacing.two,
   },
   quickAction: {
-    flex: 1,
+    flexGrow: 1,
+    flexBasis: '30%',
+    minWidth: 104,
     flexDirection: 'row',
     alignItems: 'center',
     gap: Spacing.two,
@@ -521,9 +556,19 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     padding: Spacing.three,
   },
-  heroActions: {
+  grid: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     gap: Spacing.two,
+  },
+  metricTile: {
+    width: '48%',
+    flexGrow: 1,
+    flexBasis: '48%',
+    borderWidth: 1,
+    borderRadius: 14,
+    padding: Spacing.three,
+    gap: Spacing.one,
   },
   pressed: {
     opacity: 0.75,
@@ -540,51 +585,23 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     marginBottom: Spacing.one,
   },
-  emptyText: {
+  centerText: {
     textAlign: 'center',
     marginBottom: Spacing.two,
   },
-  activityList: {
+  list: {
     gap: Spacing.three,
   },
-  activityRow: {
+  row: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: Spacing.three,
   },
-  activityIcon: {
+  roundIcon: {
     width: 40,
     height: 40,
     borderRadius: 20,
     alignItems: 'center',
     justifyContent: 'center',
-  },
-  activeRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: Spacing.three,
-  },
-  modalBackdrop: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.45)',
-    justifyContent: 'flex-end',
-  },
-  modalSheet: {
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-    padding: Spacing.four,
-    gap: Spacing.three,
-    maxHeight: '90%',
-  },
-  modalHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  modalCloseIcon: {
-    transform: [{ rotate: '45deg' }],
-  },
-  modalFields: {
-    gap: Spacing.three,
   },
 });

@@ -26,8 +26,7 @@ class CargoController extends Controller
     public function __construct(
         private SupabaseClient $supabase,
         private BookingService $bookings,
-    ) {
-    }
+    ) {}
 
     public function index(Request $request): JsonResponse
     {
@@ -66,6 +65,7 @@ class CargoController extends Controller
             'pickup_date' => $this->dateOnly($data['pickupDate']),
             'preferred_truck_type' => $this->nullable($data['preferredTruckType'] ?? null),
             'budget' => isset($data['budget']) && $data['budget'] !== null ? (float) $data['budget'] : null,
+            'currency' => $this->currency($data['currency'] ?? null),
             'special_requirements' => $this->nullable($data['specialRequirements'] ?? null),
             'status' => 'posted',
         ]);
@@ -101,6 +101,7 @@ class CargoController extends Controller
             'status' => ['sometimes', 'string', 'in:posted,matched,booked,in_transit,delivered,completed,cancelled'],
             'pickupDate' => ['sometimes', 'date'],
             'budget' => ['sometimes', 'nullable', 'numeric', 'min:0'],
+            'currency' => ['sometimes', 'string', 'size:3'],
             'description' => ['sometimes', 'nullable', 'string', 'max:2000'],
             'specialRequirements' => ['sometimes', 'nullable', 'string', 'max:2000'],
         ]);
@@ -114,6 +115,9 @@ class CargoController extends Controller
         }
         if (array_key_exists('budget', $data)) {
             $values['budget'] = $data['budget'] === null ? null : (float) $data['budget'];
+        }
+        if (array_key_exists('currency', $data)) {
+            $values['currency'] = $this->currency($data['currency']);
         }
         if (array_key_exists('description', $data)) {
             $values['description'] = $this->nullable($data['description']);
@@ -160,6 +164,7 @@ class CargoController extends Controller
             'pickupDate' => ['required', 'date'],
             'preferredTruckType' => ['nullable', 'string', 'max:100'],
             'budget' => ['nullable', 'numeric', 'min:0'],
+            'currency' => ['nullable', 'string', 'size:3'],
             'specialRequirements' => ['nullable', 'string', 'max:2000'],
         ], [
             'cargoType.required' => 'Enter the cargo type',
@@ -181,6 +186,10 @@ class CargoController extends Controller
     /** @return array<string, mixed>|null */
     private function findOwned(Request $request, string $id): ?array
     {
+        if (! $this->looksLikeId($id)) {
+            return null;
+        }
+
         $userId = (string) $request->attributes->get('auth_user')['id'];
 
         return $this->supabase->selectOne('cargo', [
@@ -213,5 +222,12 @@ class CargoController extends Controller
         $value = trim((string) $value);
 
         return $value === '' ? null : $value;
+    }
+
+    private function currency(?string $value): string
+    {
+        $value = strtoupper(trim((string) $value));
+
+        return $value === '' ? 'TZS' : $value;
     }
 }

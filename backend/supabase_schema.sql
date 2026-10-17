@@ -50,6 +50,19 @@ create index if not exists api_tokens_user_idx
   on public.api_tokens (user_id);
 
 -- ---------------------------------------------------------------------------
+-- password_reset_tokens — single-use tokens for the forgot-password flow.
+--   email: normalized (trimmed + lowercased) email OR phone, matching the
+--          identifier the account signed up with.
+--   token: SHA-256 hash of the one-time token; the raw token only ever exists
+--          in the reset link sent to the user.
+-- ---------------------------------------------------------------------------
+create table if not exists public.password_reset_tokens (
+  email      text primary key,
+  token      text not null,
+  created_at timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------------------------
 -- shipments — one row per freight shipment.
 --   status lifecycle:
 --     booked     → order received, not picked up yet   (counted as "Orders")
@@ -130,6 +143,7 @@ create trigger shipments_set_updated_at
 -- ---------------------------------------------------------------------------
 alter table public.users          enable row level security;
 alter table public.api_tokens     enable row level security;
+alter table public.password_reset_tokens enable row level security;
 alter table public.shipments      enable row level security;
 alter table public.shipment_events enable row level security;
 

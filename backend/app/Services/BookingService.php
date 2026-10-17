@@ -5,33 +5,43 @@ namespace App\Services;
 use Illuminate\Support\Carbon;
 
 /**
- * Match booking (SRS §22).
+ * Booking requests (SRS §22).
  *
- * Accepting a truck↔cargo match reserves both sides at once: the load is
- * marked `booked` and the truck is taken off the market (`booked`). Both rows
- * keep a reference to their counterpart so the pairing stays visible after it
- * drops out of the stateless matching results.
+ * Booking is no longer an instant "accept a match" write: a party sends an
+ * explicit request for a truck↔cargo pairing, and the counterparty accepts,
+ * rejects or either side cancels it. The multi-row state changes (reserving
+ * both sides, auto-rejecting the competing requests, or releasing them again)
+ * run inside the transactional Postgres functions `accept_booking` and
+ * `cancel_booking`, so a truck/load can never be double-booked even under a
+ * race. Partial unique indexes on `bookings` back that up at the schema level.
  *
- * Cross-owner rules: a caller may only accept a match when they own at least
- * one side of it (their load OR their truck). Booking is deliberately a single
- * step here — the counterparty sees the reserved status on their own records.
+ * Cross-owner rules: only a party to the pairing (their load OR their truck)
+ * may request it; only the counterparty may accept/reject; either party may
+ * cancel.
  */
 class BookingService
 {
+    /** Statuses that keep a cargo/truck committed. */
+    private const ACTIVE = ['pending', 'accepted'];
+
     public function __construct(
         private SupabaseClient $supabase,
         private MatchingEngine $engine,
-    ) {
-    }
+    ) {}
 
     /**
-     * Reserve a truck for a load (or vice-versa).
+     * Send a booking request for a truck↔cargo pairing.
      *
-     * @return array{ok: true, truck: array<string, mixed>, cargo: array<string, mixed>}
-     *        |array{ok: false, status: int, field: string, message: string}
+     * @return array{ok: true, booking: array<string, mixed>, cargo: array<string, mixed>, truck: array<string, mixed>}
+     *                                                                                                                  |array{ok: false, status: int, field: string, message: string}
      */
-    public function accept(string $userId, string $truckId, string $cargoId): array
-    {
+    public function request(
+        string $userId,
+        string $truckId,
+        string $cargoId,
+        ?float $price = null,
+        ?string $message = null
+    ): array {
         $truck = $this->supabase->selectOne('trucks', ['id' => "eq.{$truckId}"]);
         $cargo = $this->supabase->selectOne('cargo', ['id' => "eq.{$cargoId}"]);
 
@@ -39,19 +49,19 @@ class BookingService
             return $this->failure(404, 'match', 'This match is no longer available');
         }
 
-        if (
-            (string) ($truck['owner_id'] ?? '') !== $userId
-            && (string) ($cargo['owner_id'] ?? '') !== $userId
-        ) {
+        $truckOwner = (string) ($truck['owner_id'] ?? '');
+        $cargoOwner = (string) ($cargo['owner_id'] ?? '');
+
+        if ($truckOwner !== $userId && $cargoOwner !== $userId) {
             return $this->failure(403, 'match', 'You can only book your own trucks or loads');
         }
 
         if (($truck['status'] ?? '') !== 'available') {
-            return $this->failure(409, 'truck', 'That truck has just been booked');
+            return $this->failure(409, 'truck', 'That truck is no longer available');
         }
 
         if (($cargo['status'] ?? '') !== 'posted') {
-            return $this->failure(409, 'cargo', 'That load has just been booked');
+            return $this->failure(409, 'cargo', 'That load has already been booked');
         }
 
         // Re-check the hard eligibility rules so a stale match can't be booked.
@@ -59,37 +69,244 @@ class BookingService
             return $this->failure(422, 'match', 'These no longer match — check the route, weight and dates');
         }
 
-        $matchedAt = Carbon::now()->toIso8601String();
+        // The responder is the counterparty the requester does not represent.
+        $responderId = match (true) {
+            $cargoOwner === $userId => $truckOwner,
+            $truckOwner === $userId => $cargoOwner,
+            default => $userId,
+        };
 
-        $updatedTruck = $this->supabase->update('trucks', 'id', "eq.{$truckId}", [
-            'status' => 'booked',
-            'matched_cargo_id' => $cargoId,
-            'matched_at' => $matchedAt,
-        ]);
+        $currency = (string) ($cargo['currency'] ?? '') !== '' ? (string) $cargo['currency'] : 'TZS';
+        $quoted = $price ?? $this->estimatePrice($truck, $cargo);
+        $now = Carbon::now()->toIso8601String();
 
-        $updatedCargo = $this->supabase->update('cargo', 'id', "eq.{$cargoId}", [
-            'status' => 'booked',
-            'matched_truck_id' => $truckId,
-            'matched_at' => $matchedAt,
-        ]);
+        try {
+            $booking = $this->supabase->insert('bookings', [
+                'cargo_id' => $cargoId,
+                'truck_id' => $truckId,
+                'requester_id' => $userId,
+                'responder_id' => $responderId,
+                'status' => 'pending',
+                'price' => $quoted,
+                'currency' => $currency,
+                'message' => $message,
+                'requested_at' => $now,
+            ]);
+        } catch (\RuntimeException $e) {
+            if (str_contains($e->getMessage(), '23505') || str_contains($e->getMessage(), 'duplicate key')) {
+                return $this->failure(409, 'match', 'You have already requested this booking');
+            }
+
+            throw $e;
+        }
 
         return [
             'ok' => true,
-            'truck' => $updatedTruck[0] ?? array_merge($truck, [
-                'status' => 'booked',
-                'matched_cargo_id' => $cargoId,
-                'matched_at' => $matchedAt,
-            ]),
-            'cargo' => $updatedCargo[0] ?? array_merge($cargo, [
-                'status' => 'booked',
-                'matched_truck_id' => $truckId,
-                'matched_at' => $matchedAt,
-            ]),
+            'booking' => $booking,
+            'cargo' => $cargo,
+            'truck' => $truck,
         ];
     }
 
     /**
-     * Free the truck linked to a cargo row (call after cancel/complete).
+     * Accept a pending request (counterparty only). Runs the atomic DB
+     * function so both sides reserve together.
+     *
+     * @return array{ok: true, booking: array<string, mixed>, cargo: array<string, mixed>, truck: array<string, mixed>}
+     *                                                                                                                  |array{ok: false, status: int, field: string, message: string}
+     */
+    public function accept(string $userId, string $bookingId): array
+    {
+        return $this->resolveRpc($this->supabase->rpc('accept_booking', [
+            'p_booking' => $bookingId,
+            'p_user' => $userId,
+        ]));
+    }
+
+    /**
+     * Reject a pending request (counterparty only).
+     *
+     * @return array{ok: true, booking: array<string, mixed>}|array{ok: false, status: int, field: string, message: string}
+     */
+    public function reject(string $userId, string $bookingId): array
+    {
+        $booking = $this->supabase->selectOne('bookings', ['id' => "eq.{$bookingId}"]);
+
+        if ($booking === null) {
+            return $this->failure(404, 'booking', 'This booking request no longer exists');
+        }
+
+        if ((string) ($booking['responder_id'] ?? '') !== $userId) {
+            return $this->failure(403, 'booking', 'Only the other party can respond to this request');
+        }
+
+        if (($booking['status'] ?? '') !== 'pending') {
+            return $this->failure(409, 'booking', 'This request has already been answered');
+        }
+
+        $updated = $this->supabase->updateMatching('bookings', [
+            'id' => "eq.{$bookingId}",
+            'status' => 'eq.pending',
+        ], [
+            'status' => 'rejected',
+            'decided_by' => $userId,
+            'decided_at' => Carbon::now()->toIso8601String(),
+        ]);
+
+        if ($updated === []) {
+            return $this->failure(409, 'booking', 'This request has already been answered');
+        }
+
+        return ['ok' => true, 'booking' => $updated[0]];
+    }
+
+    /**
+     * Cancel a pending or accepted booking (either party). Runs the atomic DB
+     * function so an accepted booking also hands both sides back to the market.
+     *
+     * @return array{ok: true, booking: array<string, mixed>, cargo: array<string, mixed>, truck: array<string, mixed>}
+     *                                                                                                                  |array{ok: false, status: int, field: string, message: string}
+     */
+    public function cancel(string $userId, string $bookingId): array
+    {
+        return $this->resolveRpc($this->supabase->rpc('cancel_booking', [
+            'p_booking' => $bookingId,
+            'p_user' => $userId,
+        ]));
+    }
+
+    /**
+     * Every booking the caller is involved in, newest first, enriched with the
+     * counterpart load/truck and the two parties.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    public function forUser(string $userId): array
+    {
+        $rows = array_merge(
+            $this->supabase->select('bookings', [
+                'requester_id' => "eq.{$userId}",
+                'order' => 'created_at.desc',
+                'limit' => 200,
+            ]),
+            $this->supabase->select('bookings', [
+                'responder_id' => "eq.{$userId}",
+                'order' => 'created_at.desc',
+                'limit' => 200,
+            ]),
+        );
+
+        // Self-bookings appear on both sides — keep one row per booking.
+        $byId = [];
+        foreach ($rows as $row) {
+            $byId[(string) $row['id']] = $row;
+        }
+        $rows = array_values($byId);
+
+        usort($rows, static function (array $a, array $b): int {
+            return strcmp((string) ($b['created_at'] ?? ''), (string) ($a['created_at'] ?? ''));
+        });
+
+        return $this->withRelations($rows, $userId);
+    }
+
+    /**
+     * Attach the counterpart load/truck and the two parties to each booking.
+     *
+     * @param  array<int, array<string, mixed>>  $rows
+     * @return array<int, array<string, mixed>>
+     */
+    private function withRelations(array $rows, string $viewerId): array
+    {
+        if ($rows === []) {
+            return $rows;
+        }
+
+        $cargoById = $this->keyById($this->supabase->select('cargo', [
+            'select' => 'id,reference,cargo_type,weight_tons,pickup_location,destination_location,pickup_date,status,owner_id,budget,currency',
+            'id' => 'in.('.implode(',', $this->linkedIds($rows, 'cargo_id')).')',
+        ]));
+
+        $truckById = $this->keyById($this->supabase->select('trucks', [
+            'select' => 'id,registration_number,truck_type,capacity_tons,current_location,availability_date,status,owner_id,driver_name,driver_phone,rate_per_ton',
+            'id' => 'in.('.implode(',', $this->linkedIds($rows, 'truck_id')).')',
+        ]));
+
+        $userIds = array_values(array_unique(array_filter(array_merge(
+            $this->linkedIds($rows, 'requester_id'),
+            $this->linkedIds($rows, 'responder_id'),
+        ))));
+
+        $userById = $this->keyById($this->supabase->select('users', [
+            'select' => 'id,name,company_name',
+            'id' => 'in.('.implode(',', $userIds).')',
+        ]));
+
+        foreach ($rows as &$row) {
+            $row['cargo'] = $cargoById[$row['cargo_id'] ?? ''] ?? null;
+            $row['truck'] = $truckById[$row['truck_id'] ?? ''] ?? null;
+            $row['requester'] = $userById[$row['requester_id'] ?? ''] ?? null;
+            $row['responder'] = $userById[$row['responder_id'] ?? ''] ?? null;
+            $row['direction'] = ((string) ($row['requester_id'] ?? '')) === $viewerId
+                ? 'outgoing'
+                : 'incoming';
+        }
+        unset($row);
+
+        return $rows;
+    }
+
+    /**
+     * Estimate a quote: rate × weight when the truck has a rate, otherwise the
+     * load's budget. Null when neither is set.
+     *
+     * @param  array<string, mixed>  $truck
+     * @param  array<string, mixed>  $cargo
+     */
+    public function estimatePrice(array $truck, array $cargo): ?float
+    {
+        $rate = $truck['rate_per_ton'] ?? null;
+        if ($rate !== null && $rate !== '' && (float) $rate > 0) {
+            return round((float) $rate * (float) ($cargo['weight_tons'] ?? 0), 2);
+        }
+
+        $budget = $cargo['budget'] ?? null;
+        if ($budget !== null && $budget !== '') {
+            return (float) $budget;
+        }
+
+        return null;
+    }
+
+    /**
+     * Map the JSON envelope returned by accept_booking / cancel_booking to the
+     * service result shape, translating the DB error into an HTTP status.
+     *
+     * @param  array<string, mixed>  $result
+     * @return array<string, mixed>
+     */
+    private function resolveRpc(array $result): array
+    {
+        if (($result['ok'] ?? false) === true) {
+            return $result;
+        }
+
+        $status = match ($result['error'] ?? 'conflict') {
+            'not_found' => 404,
+            'forbidden' => 403,
+            default => 409,
+        };
+
+        return $this->failure(
+            $status,
+            (string) ($result['field'] ?? 'booking'),
+            (string) ($result['message'] ?? 'This booking is no longer available'),
+        );
+    }
+
+    /**
+     * Free the truck linked to a cargo row (call after cancel/complete), and
+     * cancel any still-open booking requests for it.
      *
      * @param  array<string, mixed>  $cargo
      */
@@ -101,6 +318,8 @@ class BookingService
         if (! $truckId || ! $cargoId) {
             return;
         }
+
+        $this->cancelActiveBookings('cargo_id', $cargoId);
 
         $this->supabase->update('cargo', 'id', "eq.{$cargoId}", [
             'matched_truck_id' => null,
@@ -118,7 +337,8 @@ class BookingService
     }
 
     /**
-     * Free the cargo linked to a truck row (call when the truck is unbooked).
+     * Free the cargo linked to a truck row (call when the truck is unbooked),
+     * and cancel any still-open booking requests for it.
      *
      * @param  array<string, mixed>  $truck
      */
@@ -130,6 +350,8 @@ class BookingService
         if (! $cargoId || ! $truckId) {
             return;
         }
+
+        $this->cancelActiveBookings('truck_id', $truckId);
 
         $this->supabase->update('trucks', 'id', "eq.{$truckId}", [
             'matched_cargo_id' => null,
@@ -143,6 +365,22 @@ class BookingService
                 'matched_truck_id' => null,
                 'matched_at' => null,
             ]);
+        }
+    }
+
+    /** Cancel every pending/accepted booking on one side of a pairing. */
+    private function cancelActiveBookings(string $column, string $id): void
+    {
+        try {
+            $this->supabase->updateMatching('bookings', [
+                $column => "eq.{$id}",
+                'status' => 'in.('.implode(',', self::ACTIVE).')',
+            ], [
+                'status' => 'cancelled',
+                'decided_at' => Carbon::now()->toIso8601String(),
+            ]);
+        } catch (\Throwable) {
+            // Best effort — never mask the caller's primary operation.
         }
     }
 

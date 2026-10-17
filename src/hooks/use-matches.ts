@@ -7,7 +7,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Alert } from 'react-native';
 
 import { useAuth } from '@/hooks/use-auth';
-import { api, ApiError, type ApiCargo, type ApiMatch, type ApiTruck } from '@/lib/api';
+import { api, ApiError, type ApiBooking, type ApiCargo, type ApiMatch, type ApiTruck } from '@/lib/api';
 import { readSession } from '@/lib/auth';
 
 type MatchState = {
@@ -112,16 +112,20 @@ export function useTruckMatches(truckId: string): MatchState {
   );
 }
 
-export type AcceptMatchResult =
-  | { ok: true; truck: ApiTruck; cargo: ApiCargo }
+export type RequestBookingResult =
+  | { ok: true; booking: ApiBooking; truck: ApiTruck; cargo: ApiCargo }
   | { ok: false; field: string; message: string };
 
-/** Books a match. `submittingId` is the match id currently in flight. */
-export function useAcceptMatch() {
+/** Sends a booking request for a match. `submittingId` is the match in flight. */
+export function useRequestBooking() {
   const [submittingId, setSubmittingId] = useState<string | null>(null);
 
-  const acceptMatch = useCallback(
-    async (truckId: string, cargoId: string): Promise<AcceptMatchResult> => {
+  const requestBooking = useCallback(
+    async (
+      truckId: string,
+      cargoId: string,
+      extra?: { price?: number; message?: string },
+    ): Promise<RequestBookingResult> => {
       setSubmittingId(`${truckId}:${cargoId}`);
       try {
         const session = await readSession().catch(() => null);
@@ -129,11 +133,15 @@ export function useAcceptMatch() {
           return { ok: false, field: 'session', message: 'Session expired. Sign in again.' };
         }
 
-        const result = await api.acceptMatch(session.token, { truckId, cargoId });
-        return { ok: true, truck: result.truck, cargo: result.cargo };
+        const result = await api.requestBooking(session.token, {
+          truckId,
+          cargoId,
+          ...extra,
+        });
+        return { ok: true, booking: result.booking, truck: result.truck, cargo: result.cargo };
       } catch (e) {
         if (e instanceof ApiError) return { ok: false, field: e.field, message: e.message };
-        return { ok: false, field: 'form', message: 'Could not book this match.' };
+        return { ok: false, field: 'form', message: 'Could not send the booking request.' };
       } finally {
         setSubmittingId(null);
       }
@@ -141,41 +149,42 @@ export function useAcceptMatch() {
     [],
   );
 
-  return { acceptMatch, submittingId };
+  return { requestBooking, submittingId };
 }
 
 /**
- * Wires the confirm → accept → reload flow shared by the three match screens.
- * Returns an `onAccept` handler plus the id of the match being booked.
+ * Wires the confirm → request → reload flow shared by the three match screens.
+ * Returns an `onAccept` handler (label reads "Request" in the UI) plus the id
+ * of the match currently in flight.
  */
-export function useMatchBooking(onBooked: () => void) {
-  const { acceptMatch, submittingId } = useAcceptMatch();
+export function useMatchBooking(onRequested: () => void) {
+  const { requestBooking, submittingId } = useRequestBooking();
 
-  const onBookedRef = useRef(onBooked);
+  const onRequestedRef = useRef(onRequested);
   useEffect(() => {
-    onBookedRef.current = onBooked;
+    onRequestedRef.current = onRequested;
   });
 
   const onAccept = useCallback(
     (match: ApiMatch) => {
       Alert.alert(
-        'Book this match?',
-        `Reserve the ${match.truck.truckType} (${match.truck.registrationNumber}) for ${match.cargo.pickupLocation} → ${match.cargo.destination}. This takes the truck off the market and marks the load booked.`,
+        'Send booking request?',
+        `Ask the owner to reserve the ${match.truck.truckType} (${match.truck.registrationNumber}) for ${match.cargo.pickupLocation} → ${match.cargo.destination}. They can accept or decline.`,
         [
           { text: 'Not now', style: 'cancel' },
           {
-            text: 'Book',
+            text: 'Send request',
             onPress: () => {
               void (async () => {
-                const result = await acceptMatch(match.truck.id, match.cargo.id);
+                const result = await requestBooking(match.truck.id, match.cargo.id);
                 if (result.ok) {
                   Alert.alert(
-                    'Booked',
-                    `${match.cargo.reference} is now booked with ${match.truck.registrationNumber}.`,
+                    'Request sent',
+                    `Your request for ${match.cargo.reference} is pending the other party's response. Track it under Bookings.`,
                   );
-                  onBookedRef.current();
+                  onRequestedRef.current();
                 } else {
-                  Alert.alert('Could not book', result.message);
+                  Alert.alert('Could not request', result.message);
                 }
               })();
             },
@@ -183,7 +192,7 @@ export function useMatchBooking(onBooked: () => void) {
         ],
       );
     },
-    [acceptMatch],
+    [requestBooking],
   );
 
   return { onAccept, submittingId };

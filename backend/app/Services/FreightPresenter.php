@@ -23,6 +23,9 @@ class FreightPresenter
             'capacityTons' => isset($row['capacity_tons']) ? (float) $row['capacity_tons'] : 0.0,
             'currentLocation' => $row['current_location'] ?? '',
             'availabilityDate' => self::toMillis($row['availability_date'] ?? null),
+            'driverName' => $row['driver_name'] ?? null,
+            'driverPhone' => $row['driver_phone'] ?? null,
+            'ratePerTon' => isset($row['rate_per_ton']) ? (float) $row['rate_per_ton'] : null,
             'status' => $row['status'] ?? 'available',
             'verificationStatus' => $row['verification_status'] ?? 'pending',
             'matchedCargoId' => $row['matched_cargo_id'] ?? null,
@@ -50,6 +53,7 @@ class FreightPresenter
             'pickupDate' => self::toMillis($row['pickup_date'] ?? null),
             'preferredTruckType' => $row['preferred_truck_type'] ?? null,
             'budget' => isset($row['budget']) ? (float) $row['budget'] : null,
+            'currency' => $row['currency'] ?? 'TZS',
             'specialRequirements' => $row['special_requirements'] ?? null,
             'status' => $row['status'] ?? 'posted',
             'matchedTruckId' => $row['matched_truck_id'] ?? null,
@@ -112,7 +116,68 @@ class FreightPresenter
             ],
             'truck' => $truck,
             'cargo' => $cargo,
+            'estimatedCost' => self::estimateCost($match['truck'], $match['cargo']),
         ];
+    }
+
+    /**
+     * Shapes one booking request (with its counterpart load/truck and both
+     * parties) for the app's Bookings screen.
+     *
+     * @param  array<string, mixed>  $row
+     * @return array<string, mixed>
+     */
+    public static function booking(array $row): array
+    {
+        return [
+            'id' => $row['id'],
+            'status' => $row['status'] ?? 'pending',
+            'direction' => $row['direction'] ?? 'outgoing',
+            'price' => isset($row['price']) ? (float) $row['price'] : null,
+            'currency' => $row['currency'] ?? 'TZS',
+            'message' => $row['message'] ?? null,
+            'requestedAt' => self::toMillis($row['requested_at'] ?? null),
+            'decidedAt' => self::toMillis($row['decided_at'] ?? null),
+            'cargo' => isset($row['cargo']) && is_array($row['cargo']) ? self::cargo($row['cargo']) : null,
+            'truck' => isset($row['truck']) && is_array($row['truck']) ? self::truck($row['truck']) : null,
+            'requester' => self::party($row['requester'] ?? null),
+            'responder' => self::party($row['responder'] ?? null),
+        ];
+    }
+
+    /**
+     * @param  array<string, mixed>|null  $row
+     * @return array<string, mixed>|null
+     */
+    private static function party(?array $row): ?array
+    {
+        if ($row === null) {
+            return null;
+        }
+
+        return [
+            'id' => $row['id'],
+            'name' => $row['name'] ?? '',
+            'companyName' => $row['company_name'] ?? null,
+        ];
+    }
+
+    /**
+     * Quote: rate × weight when the truck has a rate, otherwise the budget.
+     *
+     * @param  array<string, mixed>  $truck
+     * @param  array<string, mixed>  $cargo
+     */
+    private static function estimateCost(array $truck, array $cargo): ?float
+    {
+        $rate = $truck['rate_per_ton'] ?? null;
+        if ($rate !== null && $rate !== '' && (float) $rate > 0) {
+            return round((float) $rate * (float) ($cargo['weight_tons'] ?? 0), 2);
+        }
+
+        $budget = $cargo['budget'] ?? null;
+
+        return $budget !== null && $budget !== '' ? (float) $budget : null;
     }
 
     private static function toMillis(mixed $value): ?int

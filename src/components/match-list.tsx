@@ -13,6 +13,7 @@ import { useTheme } from '@/hooks/use-theme';
 import type { ApiMatch } from '@/lib/api';
 import {
   formatDate,
+  formatMoney,
   formatTons,
   MATCH_CATEGORY_TONE,
   titleCaseStatus,
@@ -26,9 +27,9 @@ export type MatchListProps = {
   /** Which side the signed-in user owns — decides the highlighted summary. */
   perspective: 'truck_owner' | 'cargo_owner';
   emptyHint: string;
-  /** When provided, each match gets a "Book" action. */
+  /** When provided, each match gets a "Request" action. */
   onAccept?: (match: ApiMatch) => void;
-  /** Id of the match currently being booked (shows a spinner on its button). */
+  /** Id of the match currently being requested (shows a spinner on its button). */
   acceptingId?: string | null;
 };
 
@@ -102,6 +103,8 @@ export function MatchList({
             ? match.cargo.cargoType
             : `${match.truck.truckType} · ${match.truck.registrationNumber}`;
 
+        const cost = formatMoney(match.estimatedCost ?? null, match.cargo.currency);
+
         return (
           <FadeInView key={match.id} index={index}>
             <Card>
@@ -136,6 +139,7 @@ export function MatchList({
                   text={`${match.truck.truckType} · ${formatTons(match.truck.capacityTons)}`}
                 />
                 <Meta icon="clock" text={formatDate(match.cargo.pickupDate) || 'Flexible'} />
+                {cost ? <Meta icon="card" text={cost} /> : null}
               </View>
 
               <View style={styles.breakdown}>
@@ -155,7 +159,7 @@ export function MatchList({
                     disabled={acceptingId !== null && acceptingId !== undefined}
                     onPress={() => onAccept(match)}
                     iconLeft={<Icon name="check" size={16} color={theme.onPrimary} />}>
-                    Book
+                    Request
                   </Button>
                 </View>
               ) : null}
@@ -167,7 +171,7 @@ export function MatchList({
   );
 }
 
-function Meta({ icon, text }: { icon: 'box' | 'truck' | 'clock'; text: string }) {
+function Meta({ icon, text }: { icon: 'box' | 'truck' | 'clock' | 'card'; text: string }) {
   const theme = useTheme();
 
   return (
