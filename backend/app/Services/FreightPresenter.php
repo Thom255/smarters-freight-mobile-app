@@ -64,6 +64,72 @@ class FreightPresenter
     }
 
     /**
+     * Shapes one commission ledger row (supabase_commissions.sql) for the
+     * admin revenue API, together with the load and booking it belongs to.
+     *
+     * @param  array<string, mixed>  $row
+     * @return array<string, mixed>
+     */
+    public static function commission(array $row): array
+    {
+        $cargo = $row['cargo'] ?? null;
+        $booking = $row['booking'] ?? null;
+
+        return [
+            'id' => $row['id'] ?? null,
+            'cargoId' => $row['cargo_id'] ?? null,
+            'bookingId' => $row['booking_id'] ?? null,
+            'cargoPrice' => isset($row['cargo_price']) ? (float) $row['cargo_price'] : null,
+            'commissionRate' => isset($row['commission_rate']) ? (float) $row['commission_rate'] : null,
+            'commissionAmount' => isset($row['commission_amount']) ? (float) $row['commission_amount'] : null,
+            'providerNetAmount' => isset($row['provider_net_amount']) ? (float) $row['provider_net_amount'] : null,
+            'currency' => $row['currency'] ?? 'TZS',
+            'status' => $row['status'] ?? 'pending',
+            'paymentReference' => $row['payment_reference'] ?? null,
+            'refundReason' => $row['refund_reason'] ?? null,
+            'earnedAt' => self::toMillis($row['earned_at'] ?? null),
+            'paidAt' => self::toMillis($row['paid_at'] ?? null),
+            'cancelledAt' => self::toMillis($row['cancelled_at'] ?? null),
+            'refundedAt' => self::toMillis($row['refunded_at'] ?? null),
+            'createdAt' => self::toMillis($row['created_at'] ?? null),
+            'cargo' => is_array($cargo) ? self::commissionCargo($cargo) : null,
+            'booking' => is_array($booking) ? self::commissionBooking($booking) : null,
+        ];
+    }
+
+    /** Traceability: which load an amount belongs to.
+     *
+     * @param  array<string, mixed>  $row
+     * @return array<string, mixed>
+     */
+    private static function commissionCargo(array $row): array
+    {
+        return [
+            'id' => $row['id'],
+            'reference' => $row['reference'] ?? '',
+            'cargoType' => $row['cargo_type'] ?? '',
+            'status' => $row['status'] ?? 'posted',
+            'pickupLocation' => $row['pickup_location'] ?? '',
+            'destination' => $row['destination_location'] ?? '',
+        ];
+    }
+
+    /** Traceability: which booking the agreed price was preserved on.
+     *
+     * @param  array<string, mixed>  $row
+     * @return array<string, mixed>
+     */
+    private static function commissionBooking(array $row): array
+    {
+        return [
+            'id' => $row['id'],
+            'status' => $row['status'] ?? 'pending',
+            'price' => isset($row['price']) && $row['price'] !== null ? (float) $row['price'] : null,
+            'currency' => $row['currency'] ?? 'TZS',
+        ];
+    }
+
+    /**
      * Compact counterpart shapes used by the "Booked with …" rows in the app.
      *
      * @param  array<string, mixed>  $row

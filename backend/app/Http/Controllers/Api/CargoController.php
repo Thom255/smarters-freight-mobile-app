@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Services\BookingService;
+use App\Services\CommissionService;
 use App\Services\FreightPresenter;
 use App\Services\SupabaseClient;
 use Illuminate\Http\JsonResponse;
@@ -17,15 +18,25 @@ use Illuminate\Support\Str;
  *   POST  /api/cargo          → { ok, cargo }           post a load
  *   GET   /api/cargo/{id}     → { ok, cargo }           owner only
  *   PATCH /api/cargo/{id}     → { ok, cargo }           edit / change status
+ *
+ * `budget` is the agreed transportation price the load is posted at; the 8%
+ * commission raised for it is derived on the server and is never readable or
+ * writable through this controller. Finishing a load is also the qualifying
+ * event that earns its commission, and cancelling one takes it back out of
+ * revenue.
  */
 class CargoController extends Controller
 {
     /** Statuses that finish a load and therefore free any reserved truck. */
     private const TERMINAL_STATUSES = ['delivered', 'completed', 'cancelled'];
 
+    /** Terminal statuses that mean the transport work was performed. */
+    private const FULFILLED_STATUSES = ['delivered', 'completed'];
+
     public function __construct(
         private SupabaseClient $supabase,
         private BookingService $bookings,
+        private CommissionService $commissions,
     ) {}
 
     public function index(Request $request): JsonResponse
@@ -142,6 +153,15 @@ class CargoController extends Controller
             $this->bookings->releaseForCargo($row);
             $row['matched_truck_id'] = null;
             $row['matched_at'] = null;
+
+            // Commission lifecycle (server-side, status-guarded):
+            //   delivered/completed → pending becomes earned (work performed)
+            //   cancelled           → pending/earned stops counting as revenue
+            if (in_array($values['status'], self::FULFILLED_STATUSES, true)) {
+                $this->commissions->markEarnedForCargo($id);
+            } else {
+                $this->commissions->cancelForCargo($id);
+            }
         }
 
         [$row] = $this->bookings->withMatchedTrucks([$row]);
@@ -163,7 +183,7 @@ class CargoController extends Controller
             'destination' => ['required', 'string', 'min:2', 'max:150'],
             'pickupDate' => ['required', 'date'],
             'preferredTruckType' => ['nullable', 'string', 'max:100'],
-            'budget' => ['nullable', 'numeric', 'min:0'],
+            'budget' => ['nullable', 'numeric', 'gt:0'],
             'currency' => ['nullable', 'string', 'size:3'],
             'specialRequirements' => ['nullable', 'string', 'max:2000'],
         ], [

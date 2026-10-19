@@ -2,7 +2,9 @@
 
 namespace Tests\Support;
 
+use App\Services\CommissionService;
 use App\Services\SupabaseClient;
+use Illuminate\Support\Str;
 
 /**
  * In-memory stand-in for SupabaseClient so controllers and services can be
@@ -32,6 +34,7 @@ class FakeSupabaseClient extends SupabaseClient
         'shipments' => ['reference'],
         'trucks' => ['registration_number'],
         'cargo' => ['reference'],
+        'commissions' => ['booking_id'],
     ];
 
     public function __construct() {}
@@ -151,8 +154,16 @@ class FakeSupabaseClient extends SupabaseClient
             $this->assertBookingActiveUnique($values);
         }
 
+        // commissions carry the 8% money CHECKs and the partial unique index
+        // that keeps one LIVE commission per load (commissions_active_cargo_unique).
+        if ($table === 'commissions') {
+            $this->assertCommissionRow($values);
+        }
+
         $row = $values;
-        $row['id'] ??= $table.'-'.(count($this->tables[$table] ?? []) + 1);
+        // Same as gen_random_uuid(): ids must look like the schema's UUIDs or
+        // the controllers' route-level `looksLikeId` guard would 404 them.
+        $row['id'] ??= (string) Str::uuid();
         $row['created_at'] ??= now()->toIso8601String();
         $row['updated_at'] ??= $row['created_at'];
 
@@ -176,6 +187,19 @@ class FakeSupabaseClient extends SupabaseClient
         foreach ($this->tables[$table] ?? [] as $index => $row) {
             if (! $this->matches($row, $filters)) {
                 continue;
+            }
+
+            // Mirror the set_commission_timestamps trigger: a status change
+            // that Postgres would refuse must be refused here too.
+            if (
+                $table === 'commissions'
+                && array_key_exists('status', $values)
+                && (string) ($row['status'] ?? '') !== (string) $values['status']
+            ) {
+                $this->assertCommissionTransition(
+                    (string) ($row['status'] ?? ''),
+                    (string) $values['status'],
+                );
             }
 
             $this->tables[$table][$index] = array_merge($row, $values, ['updated_at' => now()->toIso8601String()]);
@@ -366,6 +390,79 @@ class FakeSupabaseClient extends SupabaseClient
                     500,
                 );
             }
+        }
+    }
+
+    /**
+     * Mirrors the money CHECKs and the partial unique index in
+     * supabase_commissions.sql: the 8% split is recomputed from cargo_price
+     * and a disagreement aborts the write (23514), and only one LIVE
+     * commission may exist per cargo (23505). A wrong amount therefore cannot
+     * land in the test ledger any more than it could in Supabase.
+     *
+     * @param  array<string, mixed>  $row
+     */
+    private function assertCommissionRow(array $row): void
+    {
+        $status = (string) ($row['status'] ?? 'pending');
+
+        if (! in_array($status, CommissionService::ALL_STATUSES, true)) {
+            throw new \RuntimeException(
+                'new row for relation "commissions" violates check constraint "commissions_status_check" (23514)',
+                500,
+            );
+        }
+
+        $price = (float) ($row['cargo_price'] ?? 0);
+        $rate = (float) ($row['commission_rate'] ?? 0);
+        $amount = (float) ($row['commission_amount'] ?? 0);
+        $net = (float) ($row['provider_net_amount'] ?? 0);
+        $expectedAmount = round($price * $rate / 100, 2);
+
+        if (
+            $price <= 0
+            || abs($amount - $expectedAmount) >= 0.005
+            || abs($net - ($price - $amount)) >= 0.005
+        ) {
+            throw new \RuntimeException(
+                'new row for relation "commissions" violates check constraint "commissions_amount_check" (23514)',
+                500,
+            );
+        }
+
+        if (! in_array($status, CommissionService::REVENUE_STATUSES, true)) {
+            return;
+        }
+
+        foreach ($this->tables['commissions'] ?? [] as $existing) {
+            if (($existing['cargo_id'] ?? null) !== ($row['cargo_id'] ?? null)) {
+                continue;
+            }
+
+            if (! in_array((string) ($existing['status'] ?? ''), CommissionService::REVENUE_STATUSES, true)) {
+                continue;
+            }
+
+            throw new \RuntimeException(
+                'duplicate key value violates unique constraint "commissions_active_cargo_unique" (23505)',
+                500,
+            );
+        }
+    }
+
+    /** Same transition table as the set_commission_timestamps trigger. */
+    private function assertCommissionTransition(string $from, string $to): void
+    {
+        $allowed = [
+            'pending' => ['earned', 'paid', 'cancelled'],
+            'earned' => ['paid', 'cancelled'],
+            'paid' => ['refunded'],
+            'cancelled' => [],
+            'refunded' => [],
+        ];
+
+        if (! in_array($to, $allowed[$from] ?? [], true)) {
+            throw new \RuntimeException("invalid commission status transition: {$from} -> {$to}", 500);
         }
     }
 

@@ -14,6 +14,7 @@ export default function AppTabs() {
   const theme = useTheme();
   const { user } = useAuth();
   const isTruckOwner = user?.role === 'truck_owner';
+  const isAdmin = user?.role === 'admin';
 
   return (
     <NativeTabs
@@ -78,6 +79,16 @@ export default function AppTabs() {
           />
         </NativeTabs.Trigger>
       )}
+
+      {isAdmin ? (
+        <NativeTabs.Trigger name="admin">
+          <NativeTabs.Trigger.Label>Revenue</NativeTabs.Trigger.Label>
+          <NativeTabs.Trigger.Icon
+            sf={{ default: 'banknote', selected: 'banknote.fill' }}
+            md={{ default: 'payments', selected: 'payments' }}
+          />
+        </NativeTabs.Trigger>
+      ) : null}
 
       <NativeTabs.Trigger name="profile">
         <NativeTabs.Trigger.Label>Profile</NativeTabs.Trigger.Label>

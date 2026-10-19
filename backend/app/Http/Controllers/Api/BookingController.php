@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Services\BookingService;
+use App\Services\CommissionService;
 use App\Services\FreightPresenter;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
@@ -18,11 +19,16 @@ use Illuminate\Http\Request;
  *   POST  /api/bookings/{id}/cancel  → either party cancels (atomic)
  *
  * Accept/cancel run as Postgres functions so the load, the truck and the
- * competing requests all change in one transaction.
+ * competing requests all change in one transaction. An ACCEPT also records
+ * the platform's 8% commission on the agreed price (the qualifying event),
+ * and a CANCEL takes any unsettled commission back out of revenue.
  */
 class BookingController extends Controller
 {
-    public function __construct(private BookingService $bookings) {}
+    public function __construct(
+        private BookingService $bookings,
+        private CommissionService $commissions,
+    ) {}
 
     public function index(Request $request): JsonResponse
     {
@@ -42,7 +48,7 @@ class BookingController extends Controller
         $data = $request->validate([
             'truckId' => ['required', 'string', 'max:64'],
             'cargoId' => ['required', 'string', 'max:64'],
-            'price' => ['nullable', 'numeric', 'min:0', 'max:1000000000'],
+            'price' => ['nullable', 'numeric', 'gt:0', 'max:1000000000'],
             'message' => ['nullable', 'string', 'max:1000'],
         ], [
             'truckId.required' => 'Missing the truck to book',
@@ -97,11 +103,14 @@ class BookingController extends Controller
             return $this->error($result['status'], $result['field'], $result['message']);
         }
 
+        $commission = $this->commissions->recordForBooking($result['booking'], $result['cargo']);
+
         return response()->json([
             'ok' => true,
             'booking' => $this->present($result, $userId),
             'truck' => FreightPresenter::truck($result['truck']),
             'cargo' => FreightPresenter::cargo($result['cargo']),
+            'commission' => $commission === null ? null : FreightPresenter::commission($commission),
         ]);
     }
 
@@ -136,6 +145,11 @@ class BookingController extends Controller
         if (($result['ok'] ?? false) !== true) {
             return $this->error($result['status'], $result['field'], $result['message']);
         }
+
+        // A cancelled booking no longer earns anything: any commission that
+        // was not yet settled leaves the revenue totals (settled rows stay —
+        // only an explicit admin refund takes collected money back out).
+        $this->commissions->cancelForBooking($id);
 
         return response()->json([
             'ok' => true,

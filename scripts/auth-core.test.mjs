@@ -11,6 +11,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { mock } from 'node:test';
 
 const core = await import('../src/lib/auth-core.ts');
 const {
@@ -257,6 +258,121 @@ async function run() {
     },
   );
 
+  // --- error classification: network vs timeout vs http ----------------
+  await withFetch(
+    async () => {
+      throw new TypeError('Network request failed');
+    },
+    async () => {
+      try {
+        await api.api.dashboard('sf_token');
+        check('an unreachable host is classifyable as network', () => {
+          assert.fail('should have thrown');
+        });
+      } catch (error) {
+        check('an unreachable host is classifyable as network', () => {
+          assert.equal(error.kind, 'network');
+          assert.equal(error.status, 0);
+        });
+      }
+    },
+  );
+
+  // The deadline is driven by setTimeout, so freeze the clock, hang the
+  // request, then jump past the deadline instead of waiting it out.
+  mock.timers.enable({ apis: ['setTimeout'] });
+  await withFetch(
+    (_url, init) =>
+      new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(new Error('Request aborted')));
+      }),
+    async () => {
+      const pending = api.api.dashboard('sf_token');
+      mock.timers.tick(60_000);
+      try {
+        await pending;
+        check('a hung request times out as its own kind', () => {
+          assert.fail('should have thrown');
+        });
+      } catch (error) {
+        check('a hung request times out as its own kind', () => {
+          assert.ok(error instanceof api.ApiError);
+          assert.equal(error.kind, 'timeout');
+          assert.equal(error.status, 0);
+          assert.ok(error.message.includes('too long'));
+        });
+      }
+    },
+  );
+  mock.timers.reset();
+
+  // Bodies with no usable `message` must still read as plain English.
+  await withFetch(
+    async () => new Response('Bad Gateway', { status: 502 }),
+    async () => {
+      try {
+        await api.api.dashboard('sf_token');
+        check('a bare proxy error gets a friendly fallback message', () => {
+          assert.fail('should have thrown');
+        });
+      } catch (error) {
+        check('a bare proxy error gets a friendly fallback message', () => {
+          assert.equal(error.kind, 'http');
+          assert.equal(error.status, 502);
+          assert.ok(error.message.includes('server'));
+          assert.ok(!error.message.includes('Request failed ('));
+        });
+      }
+    },
+  );
+
+  await withFetch(
+    async () =>
+      new Response(JSON.stringify({ ok: false }), {
+        status: 401,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    async () => {
+      try {
+        await api.api.me('sf_expired');
+        check('a message-less 401 falls back to the session-expired wording', () => {
+          assert.fail('should have thrown');
+        });
+      } catch (error) {
+        check('a message-less 401 falls back to the session-expired wording', () => {
+          assert.equal(error.kind, 'http');
+          assert.equal(error.status, 401);
+          assert.equal(error.message, 'Session expired. Please sign in again.');
+        });
+      }
+    },
+  );
+
+  // A dashboard 500 must read as plain English — never a raw status or any
+  // server-side detail — so the screen can offer a retry with useful copy.
+  await withFetch(
+    async () => new Response(null, { status: 500 }),
+    async () => {
+      try {
+        await api.api.dashboard('sf_token');
+        check('a dashboard 500 gets a friendly server-error message', () => {
+          assert.fail('should have thrown');
+        });
+      } catch (error) {
+        check('a dashboard 500 gets a friendly server-error message', () => {
+          assert.ok(error instanceof api.ApiError);
+          assert.equal(error.kind, 'http');
+          assert.equal(error.status, 500);
+          assert.equal(error.message, 'Something went wrong on the server. Please try again shortly.');
+          const text = error.message.toLowerCase();
+          assert.ok(!text.includes('exception'));
+          assert.ok(!text.includes('stack'));
+          assert.ok(!text.includes('supabase'));
+        });
+      }
+    },
+  );
+
   await withFetch(
     async (url, init) => {
       assert.ok(String(url).endsWith('/api/dashboard'));
@@ -327,6 +443,110 @@ async function run() {
         assert.equal(payload.alerts[0].tone, 'info');
         assert.deepEqual(payload.recentActivity, []);
       });
+    },
+  );
+
+  await withFetch(
+    async (url, init) => {
+      assert.ok(String(url).endsWith('/api/admin/revenue'));
+      assert.equal(init.method, 'GET');
+      assert.equal(init.headers.Authorization, 'Bearer sf_admin_token');
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          commissionRate: 8,
+          currency: 'TZS',
+          totals: {
+            cargoValue: 3500000,
+            pendingCommission: 80000,
+            earnedCommission: 40000,
+            paidCommission: 160000,
+            cancelledCommission: 80000,
+            refundedCommission: 80000,
+            liveCommission: 280000,
+            completedShipments: 2,
+          },
+          counts: { pending: 1, earned: 1, paid: 1, cancelled: 1, refunded: 1, total: 5 },
+          commissions: [
+            {
+              id: 'c1',
+              cargoId: 'g1',
+              bookingId: 'b1',
+              cargoPrice: 1000000,
+              commissionRate: 8,
+              commissionAmount: 80000,
+              providerNetAmount: 920000,
+              currency: 'TZS',
+              status: 'pending',
+              paymentReference: null,
+              refundReason: null,
+              earnedAt: null,
+              paidAt: null,
+              cancelledAt: null,
+              refundedAt: null,
+              createdAt: 1791618027000,
+              cargo: {
+                id: 'g1',
+                reference: 'CG-ABC123',
+                cargoType: 'General cargo',
+                status: 'booked',
+                pickupLocation: 'Dar es Salaam',
+                destination: 'Mwanza',
+              },
+              booking: { id: 'b1', status: 'accepted', price: 1000000, currency: 'TZS' },
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    },
+    async () => {
+      const payload = await api.api.adminRevenue('sf_admin_token');
+      check('adminRevenue attaches bearer token and parses the revenue payload', () => {
+        assert.equal(payload.commissionRate, 8);
+        assert.equal(payload.currency, 'TZS');
+        assert.equal(payload.totals.cargoValue, 3500000);
+        assert.equal(payload.totals.pendingCommission, 80000);
+        assert.equal(payload.totals.paidCommission, 160000);
+        assert.equal(payload.totals.liveCommission, 280000);
+        assert.equal(payload.totals.completedShipments, 2);
+        assert.equal(payload.counts.total, 5);
+        assert.equal(payload.commissions.length, 1);
+        // The TZS 1,000,000 example, straight from the server.
+        assert.equal(payload.commissions[0].cargoPrice, 1000000);
+        assert.equal(payload.commissions[0].commissionAmount, 80000);
+        assert.equal(payload.commissions[0].providerNetAmount, 920000);
+        assert.equal(payload.commissions[0].cargo.reference, 'CG-ABC123');
+        assert.equal(payload.commissions[0].booking.status, 'accepted');
+      });
+    },
+  );
+
+  await withFetch(
+    async (url) => {
+      assert.ok(String(url).endsWith('/api/admin/revenue'));
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          field: 'role',
+          message: 'Your account type does not allow that action.',
+        }),
+        { status: 403, headers: { 'Content-Type': 'application/json' } },
+      );
+    },
+    async () => {
+      try {
+        await api.api.adminRevenue('sf_token');
+        check('adminRevenue 403 surfaces as ApiError with field role', () => {
+          assert.fail('should have thrown');
+        });
+      } catch (error) {
+        check('adminRevenue 403 surfaces as ApiError with field role', () => {
+          assert.ok(error instanceof api.ApiError);
+          assert.equal(error.status, 403);
+          assert.equal(error.field, 'role');
+        });
+      }
     },
   );
 

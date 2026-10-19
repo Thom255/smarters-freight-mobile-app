@@ -1,5 +1,6 @@
 <?php
 
+use App\Http\Controllers\Api\AdminCommissionController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\BookingController;
 use App\Http\Controllers\Api\CargoController;
@@ -78,4 +79,14 @@ Route::middleware(['auth.api', 'throttle:api'])->group(function () {
     Route::post('/bookings/{id}/accept', [BookingController::class, 'accept']);
     Route::post('/bookings/{id}/reject', [BookingController::class, 'reject']);
     Route::post('/bookings/{id}/cancel', [BookingController::class, 'cancel']);
+
+    // Admin — 8% platform commission ledger & revenue. Admin only: revenue
+    // and settlement are never exposed to cargo/truck owners, and no other
+    // route on this surface can touch the commissions table at all.
+    Route::get('/admin/revenue', [AdminCommissionController::class, 'revenue'])
+        ->middleware('auth.role:admin');
+    Route::post('/admin/commissions/{id}/settle', [AdminCommissionController::class, 'settle'])
+        ->middleware('auth.role:admin');
+    Route::post('/admin/commissions/{id}/refund', [AdminCommissionController::class, 'refund'])
+        ->middleware('auth.role:admin');
 });

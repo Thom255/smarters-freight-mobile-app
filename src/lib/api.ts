@@ -22,18 +22,71 @@ const BASE_URL = (process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:8001').re
 /** Error body the backend returns for any failure: { ok:false, field, message }. */
 type ApiErrorShape = { ok?: false; field?: string; message?: string };
 
+/**
+ * What actually went wrong, so screens/devs can tell the three cases apart
+ * without parsing message text:
+ *   network — no HTTP response at all (unreachable host, refused, DNS)
+ *   timeout — a request was sent but no response arrived in time
+ *   http    — the server answered with a non-2xx status
+ */
+export type ApiErrorKind = 'network' | 'timeout' | 'http';
+
 export class ApiError extends Error {
+  /** HTTP status; 0 when no response was received (network/timeout). */
   readonly status: number;
   /** AuthField the error belongs to ('form' = not tied to one input). */
   readonly field: string;
+  readonly kind: ApiErrorKind;
 
-  constructor(message: string, status = 0, field = 'form') {
+  constructor(message: string, status = 0, field = 'form', kind: ApiErrorKind = 'http') {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.field = field;
+    this.kind = kind;
   }
 }
+
+const NETWORK_MESSAGE = 'Cannot reach the server. Check your connection and try again.';
+const TIMEOUT_MESSAGE = 'The server took too long to respond. Please try again.';
+
+/**
+ * Fallback text when the backend sent no usable `message`. The server's own
+ * envelope message always wins when present — these only cover bare/proxy
+ * responses so the user never sees a raw `Request failed (500)`.
+ */
+function defaultMessage(status: number): string {
+  switch (status) {
+    case 0:
+      return NETWORK_MESSAGE;
+    case 400:
+    case 422:
+      return 'Please check the details you entered and try again.';
+    case 401:
+      return 'Session expired. Please sign in again.';
+    case 403:
+      return 'You do not have permission to do that.';
+    case 404:
+      return 'We could not find that. It may have been removed — refresh and try again.';
+    case 408:
+      return TIMEOUT_MESSAGE;
+    case 409:
+      return 'This conflicts with the current state. Refresh and try again.';
+    case 429:
+      return 'Too many attempts. Wait a moment and try again.';
+    default:
+      return status >= 500
+        ? 'Something went wrong on the server. Please try again shortly.'
+        : `Request failed (${status})`;
+  }
+}
+
+/**
+ * Ceiling on a single request. The backend spends at most ~10s waiting on
+ * Supabase, and PHP's own limit is 30s — without a client-side deadline a
+ * stalled connection leaves the caller spinning forever with no error.
+ */
+const REQUEST_TIMEOUT_MS = 20_000;
 
 /**
  * Central 401 handling.
@@ -74,6 +127,9 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   const { method = 'GET', body, token } = options;
 
   let response: Response;
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
   try {
     response = await fetch(`${BASE_URL}${path}`, {
       method,
@@ -83,9 +139,18 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
     });
   } catch {
-    throw new ApiError('Cannot reach the server. Check your connection and try again.', 0);
+    // No response arrived: either our own deadline fired (aborted) or the
+    // connection failed outright. Reported as two distinct, actionable cases
+    // instead of one ambiguous "connection error".
+    if (controller.signal.aborted) {
+      throw new ApiError(TIMEOUT_MESSAGE, 0, 'form', 'timeout');
+    }
+    throw new ApiError(NETWORK_MESSAGE, 0, 'form', 'network');
+  } finally {
+    clearTimeout(deadline);
   }
 
   let payload: unknown = null;
@@ -97,11 +162,9 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
 
   if (!response.ok) {
     const shape = (payload ?? {}) as ApiErrorShape;
-    const message =
-      shape.message ??
-      (response.status === 401
-        ? 'Session expired. Please sign in again.'
-        : `Request failed (${response.status})`);
+    // Server-provided message/field first (the { ok:false, field, message }
+    // contract), status-specific wording only when the body is unusable.
+    const message = shape.message ?? defaultMessage(response.status);
     const field = shape.field ?? 'form';
 
     // A rejected authenticated call means the stored session is dead — tell
@@ -409,6 +472,74 @@ export type DashboardPayload = {
   alerts: DashboardAlert[];
 };
 
+/** Commission ledger statuses (backend `commissions.status`). */
+export type CommissionStatus =
+  | 'pending'
+  | 'earned'
+  | 'paid'
+  | 'cancelled'
+  | 'refunded';
+
+/** The load a commission belongs to (traceability on the admin screen). */
+export type ApiCommissionCargo = {
+  id: string;
+  reference: string;
+  cargoType: string;
+  status: ApiCargo['status'];
+  pickupLocation: string;
+  destination: string;
+};
+
+/** One row of the 8% platform commission ledger. */
+export type ApiCommission = {
+  id: string;
+  cargoId: string;
+  bookingId: string | null;
+  /** Agreed transportation price the split is derived from. */
+  cargoPrice: number;
+  commissionRate: number;
+  commissionAmount: number;
+  providerNetAmount: number;
+  currency: string;
+  status: CommissionStatus;
+  /** Settlement evidence — never set by the app, only read from the server. */
+  paymentReference: string | null;
+  refundReason: string | null;
+  earnedAt: number | null;
+  paidAt: number | null;
+  cancelledAt: number | null;
+  refundedAt: number | null;
+  createdAt: number | null;
+  cargo: ApiCommissionCargo | null;
+  booking: { id: string; status: BookingStatus; price: number | null; currency: string } | null;
+};
+
+/**
+ * GET /api/admin/revenue — admin only. Every total is computed server-side
+ * from ledger rows whose statuses are mutually exclusive, so no amount is
+ * ever counted twice; `paidCommission` moves only when settlement evidence is
+ * recorded against it.
+ */
+export type RevenuePayload = {
+  ok: true;
+  commissionRate: number;
+  currency: string;
+  totals: {
+    /** Agreed prices of loads with a live commission (not cancelled/refunded). */
+    cargoValue: number;
+    pendingCommission: number;
+    earnedCommission: number;
+    paidCommission: number;
+    cancelledCommission: number;
+    refundedCommission: number;
+    /** pending + earned + paid — what the platform still holds. */
+    liveCommission: number;
+    completedShipments: number;
+  };
+  counts: Record<CommissionStatus | 'total', number>;
+  commissions: ApiCommission[];
+};
+
 // ---------------------------------------------------------------------------
 // Endpoints
 // ---------------------------------------------------------------------------
@@ -454,6 +585,11 @@ export const api = {
 
   dashboard(token: string): Promise<DashboardPayload> {
     return request('/api/dashboard', { token });
+  },
+
+  /** Admin only — 8% commission totals, counts and ledger records. */
+  adminRevenue(token: string): Promise<RevenuePayload> {
+    return request('/api/admin/revenue', { token });
   },
 
   shipments(token: string): Promise<{ ok: true; shipments: ApiShipment[] }> {

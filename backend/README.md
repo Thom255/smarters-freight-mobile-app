@@ -28,7 +28,11 @@ cd backend
 composer install
 cp .env.example .env          # then fill in the values below
 php artisan key:generate
-php artisan serve             # http://127.0.0.1:8000
+php artisan serve --host=0.0.0.0 --port=8001
+#   Port 8001 is what EXPO_PUBLIC_API_URL points at (port 8000 is a different,
+#   legacy API). --host=0.0.0.0 keeps it reachable from a phone on the LAN —
+#   the 127.0.0.1 default is only visible from this computer.
+#   Health check: GET http://<this-computer-LAN-IP>:8001/up → 200
 ```
 
 ### Environment (backend/.env)
@@ -64,7 +68,8 @@ Run these once, in order, in the Supabase SQL Editor:
 
 ## API reference
 
-Base URL: `http://127.0.0.1:8000` (or your host). All responses are JSON.
+Base URL: `http://127.0.0.1:8001` locally, or `http://<this-computer-LAN-IP>:8001`
+from a phone (must match the app's `EXPO_PUBLIC_API_URL`). All responses are JSON.
 Failures are `{ "ok": false, "field": "<form|name|identifier|password|confirm>", "message": "..." }`.
 
 ### Public
