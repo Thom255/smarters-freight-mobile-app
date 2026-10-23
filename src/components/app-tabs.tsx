@@ -6,15 +6,45 @@ import { useTheme } from '@/hooks/use-theme';
 /**
  * Role-aware native tab bar.
  *
- * Cargo owners get a "Cargo" tab for their posted loads; truck owners get a
- * "Fleet" tab for their trucks. Everything else (Home, Shipments, Matches,
- * Profile) is shared.
+ * Admins get the system dashboard (overview, revenue and records) plus their
+ * profile. Cargo owners get a "Cargo" tab for their posted loads; truck owners
+ * get a "Fleet" tab for their trucks. Only the current role's workspace is
+ * mounted, so another role's dashboard cannot be reached by switching tabs.
  */
 export default function AppTabs() {
   const theme = useTheme();
   const { user } = useAuth();
   const isTruckOwner = user?.role === 'truck_owner';
   const isAdmin = user?.role === 'admin';
+
+  const profileTrigger = (
+    <NativeTabs.Trigger name="profile">
+      <NativeTabs.Trigger.Label>Profile</NativeTabs.Trigger.Label>
+      <NativeTabs.Trigger.Icon
+        sf={{ default: 'person.crop.circle', selected: 'person.crop.circle.fill' }}
+        md={{ default: 'account_circle', selected: 'account_circle' }}
+      />
+    </NativeTabs.Trigger>
+  );
+
+  if (isAdmin) {
+    return (
+      <NativeTabs
+        backgroundColor={theme.background}
+        indicatorColor={theme.backgroundElement}
+        tintColor={theme.primary}
+        labelStyle={{ selected: { color: theme.primary } }}>
+        <NativeTabs.Trigger name="admin">
+          <NativeTabs.Trigger.Label>Admin</NativeTabs.Trigger.Label>
+          <NativeTabs.Trigger.Icon
+            sf={{ default: 'square.grid.2x2', selected: 'square.grid.2x2.fill' }}
+            md={{ default: 'dashboard', selected: 'dashboard' }}
+          />
+        </NativeTabs.Trigger>
+        {profileTrigger}
+      </NativeTabs>
+    );
+  }
 
   return (
     <NativeTabs
@@ -80,23 +110,7 @@ export default function AppTabs() {
         </NativeTabs.Trigger>
       )}
 
-      {isAdmin ? (
-        <NativeTabs.Trigger name="admin">
-          <NativeTabs.Trigger.Label>Revenue</NativeTabs.Trigger.Label>
-          <NativeTabs.Trigger.Icon
-            sf={{ default: 'banknote', selected: 'banknote.fill' }}
-            md={{ default: 'payments', selected: 'payments' }}
-          />
-        </NativeTabs.Trigger>
-      ) : null}
-
-      <NativeTabs.Trigger name="profile">
-        <NativeTabs.Trigger.Label>Profile</NativeTabs.Trigger.Label>
-        <NativeTabs.Trigger.Icon
-          sf={{ default: 'person.crop.circle', selected: 'person.crop.circle.fill' }}
-          md={{ default: 'account_circle', selected: 'account_circle' }}
-        />
-      </NativeTabs.Trigger>
+      {profileTrigger}
     </NativeTabs>
   );
 }

@@ -12,6 +12,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from 'react';
@@ -54,6 +55,8 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<AuthStatus>('loading');
   const [user, setUser] = useState<User | null>(null);
+  /** In-flight guard so concurrent signOut calls collapse into one. */
+  const signingOutRef = useRef(false);
 
   /** Drops the local session without a server round trip. Idempotent. */
   const clearLocalSession = useCallback(async () => {
@@ -143,17 +146,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const signOut = useCallback(async () => {
-    // Read the token before clearing so the server revokes it too.
-    const session = await readSession().catch(() => null);
+    // One logout at a time — a second tap while one is running is a no-op.
+    if (signingOutRef.current) return;
+    signingOutRef.current = true;
 
-    await clearSession();
-    setUser(null);
-    setStatus('signedOut');
+    try {
+      // Read the token before clearing so the server can revoke it too.
+      // Local cleanup comes FIRST and cannot be blocked: a failing storage
+      // write or an unreachable API must never leave the user stuck behind
+      // the protected screens (the state flip below is what unmounts them).
+      const session = await readSession().catch(() => null);
+      await clearSession().catch(() => undefined);
 
-    if (session?.token) {
-      await api.logout(session.token).catch(() => {
-        // Best effort — local session is already gone.
-      });
+      setUser(null);
+      setStatus('signedOut');
+
+      if (session?.token) {
+        await api.logout(session.token).catch(() => {
+          // Best effort — local session is already gone.
+        });
+      }
+    } finally {
+      signingOutRef.current = false;
     }
   }, []);
 

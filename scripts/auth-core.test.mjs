@@ -25,6 +25,9 @@ const {
   validateForgotPassword,
   validateResetPassword,
   toAuthFailure,
+  dashboardPathForRole,
+  roleCanAccessArea,
+  normalizeRole,
 } = core;
 
 const PASSWORD = 'sekret123';
@@ -65,6 +68,100 @@ async function run() {
   check('confirm validation', () => {
     assert.equal(validateConfirm(PASSWORD, PASSWORD), null);
     assert.ok(validateConfirm(PASSWORD, 'other').includes('do not match'));
+  });
+
+  // --- role routing helpers --------------------------------------------
+  check('role dashboard routing maps roles correctly', () => {
+    assert.equal(dashboardPathForRole('admin'), '/admin');
+    assert.equal(dashboardPathForRole('cargo_owner'), '/');
+    assert.equal(dashboardPathForRole('truck_owner'), '/');
+    assert.equal(dashboardPathForRole(null), '/');
+    assert.equal(dashboardPathForRole(undefined), '/');
+  });
+  check('role area access is enforced server-side scope', () => {
+    assert.equal(roleCanAccessArea('admin', 'admin'), true);
+    assert.equal(roleCanAccessArea('cargo_owner', 'admin'), false);
+    assert.equal(roleCanAccessArea('truck_owner', 'admin'), false);
+    assert.equal(roleCanAccessArea('cargo_owner', 'cargo'), true);
+    assert.equal(roleCanAccessArea('truck_owner', 'cargo'), false);
+    assert.equal(roleCanAccessArea('truck_owner', 'trucks'), true);
+    assert.equal(roleCanAccessArea('cargo_owner', 'trucks'), false);
+  });
+  check('normalizeRole coerces unknown/invalid to least privileged', () => {
+    assert.equal(normalizeRole('admin'), 'admin');
+    assert.equal(normalizeRole('truck_owner'), 'truck_owner');
+    assert.equal(normalizeRole('cargo_owner'), 'cargo_owner');
+    assert.equal(normalizeRole('superuser'), 'cargo_owner');
+    assert.equal(normalizeRole(null), 'cargo_owner');
+    assert.equal(normalizeRole(undefined), 'cargo_owner');
+  });
+
+  // --- session restoration (app restart keeps the right role) -------------
+  check('parseSession restores a saved session with its role', () => {
+    const session = core.parseSession(
+      JSON.stringify({
+        user: {
+          id: 'u1',
+          identifier: 'amina@co.tz',
+          name: 'Amina',
+          role: 'truck_owner',
+          companyName: 'Acme Fleet',
+          createdAt: 5,
+        },
+        token: 'sf_token',
+        issuedAt: 123,
+      }),
+    );
+    assert.equal(session.user.id, 'u1');
+    assert.equal(session.user.role, 'truck_owner');
+    assert.equal(session.user.companyName, 'Acme Fleet');
+    assert.equal(session.token, 'sf_token');
+    assert.equal(session.issuedAt, 123);
+  });
+
+  check('parseSession backfills legacy sessions without a role as least-privileged', () => {
+    const session = core.parseSession(
+      JSON.stringify({ user: { id: 'u1', identifier: 'a@b.co' }, token: 'sf_t' }),
+    );
+    assert.equal(session.user.role, 'cargo_owner');
+    assert.equal(session.user.companyName, null);
+    assert.equal(session.user.name, null);
+  });
+
+  check('parseSession never routes a tampered role to admin', () => {
+    const tampered = core.parseSession(
+      JSON.stringify({ user: { id: 'u1', role: 'superuser' }, token: 'sf_t' }),
+    );
+    assert.equal(tampered.user.role, 'cargo_owner');
+
+    // A real admin's persisted session still restores correctly.
+    const admin = core.parseSession(
+      JSON.stringify({ user: { id: 'u1', role: 'admin' }, token: 'sf_t' }),
+    );
+    assert.equal(admin.user.role, 'admin');
+  });
+
+  check('parseSession rejects corrupt or incomplete payloads', () => {
+    assert.equal(core.parseSession(null), null);
+    assert.equal(core.parseSession(undefined), null);
+    assert.equal(core.parseSession(''), null);
+    assert.equal(core.parseSession('{nope'), null);
+    assert.equal(core.parseSession(JSON.stringify({ user: { id: 'u1' } })), null);
+    assert.equal(core.parseSession(JSON.stringify({ token: 'sf_t' })), null);
+    assert.equal(core.parseSession(JSON.stringify({ user: {}, token: 'sf_t' })), null);
+    assert.equal(core.parseSession(JSON.stringify({ user: { id: '' }, token: 'sf_t' })), null);
+  });
+
+  check('register validation refuses a self-selected admin role', () => {
+    const failure = validateRegister({
+      name: 'Sneaky User',
+      identifier: 'sneaky@example.com',
+      password: PASSWORD,
+      confirm: PASSWORD,
+      role: 'admin',
+    });
+    assert.equal(failure.ok, false);
+    assert.equal(failure.field, 'role');
   });
 
   // --- form-level guards ------------------------------------------------
@@ -238,6 +335,32 @@ async function run() {
     },
   );
 
+  // The live login failure users report ("Cannot reach the server...") comes
+  // from fetch rejecting before any HTTP response exists. Login must surface
+  // that exact case (not a misleading credentials error) so the cause is
+  // diagnosable; scripts/api-connectivity.test.mjs reproduces it end-to-end.
+  await withFetch(
+    async () => {
+      throw new TypeError('Network request failed');
+    },
+    async () => {
+      try {
+        await api.api.login({ identifier: 'amina@co.tz', password: PASSWORD });
+        check('login network failure becomes friendly ApiError', () => {
+          assert.fail('should have thrown');
+        });
+      } catch (error) {
+        check('login network failure becomes friendly ApiError', () => {
+          assert.ok(error instanceof api.ApiError);
+          assert.equal(error.kind, 'network');
+          assert.equal(error.status, 0);
+          assert.equal(error.field, 'form');
+          assert.ok(error.message.includes('Cannot reach the server'));
+        });
+      }
+    },
+  );
+
   await withFetch(
     async () => {
       throw new TypeError('Network request failed');
@@ -259,51 +382,69 @@ async function run() {
   );
 
   // --- error classification: network vs timeout vs http ----------------
-  await withFetch(
-    async () => {
-      throw new TypeError('Network request failed');
-    },
-    async () => {
-      try {
-        await api.api.dashboard('sf_token');
-        check('an unreachable host is classifyable as network', () => {
-          assert.fail('should have thrown');
-        });
-      } catch (error) {
-        check('an unreachable host is classifyable as network', () => {
-          assert.equal(error.kind, 'network');
-          assert.equal(error.status, 0);
-        });
-      }
-    },
-  );
+  {
+    let calls = 0;
+    await withFetch(
+      async () => {
+        calls += 1;
+        throw new TypeError('Network request failed');
+      },
+      async () => {
+        try {
+          await api.api.dashboard('sf_token');
+          check('an unreachable host is classifyable as network', () => {
+            assert.fail('should have thrown');
+          });
+        } catch (error) {
+          check('an unreachable host is classifyable as network', () => {
+            assert.equal(error.kind, 'network');
+            assert.equal(error.status, 0);
+          });
+          // Root cause of the reported "Couldn't load your dashboard" screen:
+          // the backend was not listening. The retry must exist, be BOUNDED
+          // (no retry loop), and still surface the honest network error.
+          check('a dead backend is retried a bounded number of times, then fails honestly', () => {
+            assert.equal(calls, 3, `expected initial + 2 retries, saw ${calls} attempts`);
+          });
+        }
+      },
+    );
+  }
 
   // The deadline is driven by setTimeout, so freeze the clock, hang the
   // request, then jump past the deadline instead of waiting it out.
   mock.timers.enable({ apis: ['setTimeout'] });
-  await withFetch(
-    (_url, init) =>
-      new Promise((_resolve, reject) => {
-        init.signal.addEventListener('abort', () => reject(new Error('Request aborted')));
-      }),
-    async () => {
-      const pending = api.api.dashboard('sf_token');
-      mock.timers.tick(60_000);
-      try {
-        await pending;
-        check('a hung request times out as its own kind', () => {
-          assert.fail('should have thrown');
+  {
+    let calls = 0;
+    await withFetch(
+      (_url, init) => {
+        calls += 1;
+        return new Promise((_resolve, reject) => {
+          init.signal.addEventListener('abort', () => reject(new Error('Request aborted')));
         });
-      } catch (error) {
-        check('a hung request times out as its own kind', () => {
-          assert.ok(error instanceof api.ApiError);
-          assert.equal(error.kind, 'timeout');
-          assert.equal(error.status, 0);
-          assert.ok(error.message.includes('too long'));
-        });
-      }
-    },
-  );
+      },
+      async () => {
+        const pending = api.api.dashboard('sf_token');
+        mock.timers.tick(60_000);
+        try {
+          await pending;
+          check('a hung request times out as its own kind', () => {
+            assert.fail('should have thrown');
+          });
+        } catch (error) {
+          check('a hung request times out as its own kind', () => {
+            assert.ok(error instanceof api.ApiError);
+            assert.equal(error.kind, 'timeout');
+            assert.equal(error.status, 0);
+            assert.ok(error.message.includes('too long'));
+          });
+          check('a timeout is not auto-retried (would stall the screen for a minute)', () => {
+            assert.equal(calls, 1);
+          });
+        }
+      },
+    );
+  }
   mock.timers.reset();
 
   // Bodies with no usable `message` must still read as plain English.
@@ -347,6 +488,119 @@ async function run() {
       }
     },
   );
+
+  // --- transient retry: backend briefly unreachable -------------------------
+  {
+    let calls = 0;
+    await withFetch(
+      async () => {
+        calls += 1;
+        if (calls === 1) throw new TypeError('Network request failed');
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            role: 'cargo_owner',
+            stats: { shipments: 1, booked: 1, inTransit: 0, delivered: 0, cancelled: 0, orders: 1 },
+            marketplace: { trucks: 0, availableTrucks: 0, cargo: 0, postedCargo: 0, matches: 0 },
+            fleet: { total: 0, available: 0, booked: 0, inTransit: 0, maintenance: 0, inactive: 0 },
+            loads: { total: 0, pending: 0, confirmed: 0, inTransit: 0, completed: 0, cancelled: 0 },
+            bookings: { active: 0 },
+            activeShipment: null,
+            upcomingDeliveries: [],
+            recentActivity: [],
+            alerts: [],
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      },
+      async () => {
+        const payload = await api.api.dashboard('sf_token');
+        check('the dashboard recovers on its retry once the server answers again', () => {
+          assert.equal(calls, 2);
+          assert.equal(payload.stats.shipments, 1);
+        });
+      },
+    );
+  }
+
+  {
+    let calls = 0;
+    await withFetch(
+      async () => {
+        calls += 1;
+        return new Response(JSON.stringify({ ok: false, field: 'session', message: 'Invalid or revoked token' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      },
+      async () => {
+        try {
+          await api.api.dashboard('sf_token');
+          check('a 401 dashboard rejection surfaces as ApiError', () => {
+            assert.fail('should have thrown');
+          });
+        } catch (error) {
+          check('a 401 is never retried — auth failures must fail fast', () => {
+            assert.equal(calls, 1);
+            assert.ok(error instanceof api.ApiError);
+            assert.equal(error.status, 401);
+          });
+        }
+      },
+    );
+  }
+
+  // --- normalizeDashboardPayload: partial bodies degrade per section --------
+  check('normalizeDashboardPayload passes a complete payload through unchanged', () => {
+    const payload = api.normalizeDashboardPayload({
+      ok: true,
+      role: 'truck_owner',
+      stats: { shipments: 2, booked: 1, inTransit: 1, delivered: 0, cancelled: 0, orders: 1 },
+      marketplace: { trucks: 1, availableTrucks: 1, cargo: 3, postedCargo: 3, matches: 4 },
+      fleet: { total: 5, available: 2, booked: 1, inTransit: 1, maintenance: 1, inactive: 0 },
+      loads: { total: 0, pending: 0, confirmed: 0, inTransit: 0, completed: 0, cancelled: 0 },
+      bookings: { active: 2 },
+      activeShipment: null,
+      upcomingDeliveries: [
+        { id: 'shp_1', reference: 'SF-1', origin: 'A', destination: 'B', status: 'booked', createdAt: 1 },
+      ],
+      recentActivity: [],
+      alerts: [{ id: 'a1', tone: 'info', title: 't', body: null }],
+    });
+    assert.equal(payload.role, 'truck_owner');
+    assert.equal(payload.stats.orders, 1);
+    assert.equal(payload.fleet.total, 5);
+    assert.equal(payload.marketplace.matches, 4);
+    assert.equal(payload.upcomingDeliveries.length, 1);
+    assert.equal(payload.alerts[0].id, 'a1');
+  });
+
+  check('normalizeDashboardPayload degrades a missing section instead of crashing the screen', () => {
+    const payload = api.normalizeDashboardPayload({ ok: true, stats: { shipments: 2, booked: 1 } });
+    assert.equal(payload.stats.shipments, 2);
+    // Legacy alias derives from `booked` when absent.
+    assert.equal(payload.stats.orders, 1);
+    assert.equal(payload.fleet.total, 0);
+    assert.equal(payload.loads.total, 0);
+    assert.equal(payload.bookings.active, 0);
+    assert.deepEqual(payload.alerts, []);
+    assert.deepEqual(payload.upcomingDeliveries, []);
+    assert.deepEqual(payload.recentActivity, []);
+    assert.equal(payload.activeShipment, null);
+    assert.equal(payload.role, 'cargo_owner');
+  });
+
+  check('normalizeDashboardPayload rejects a non-dashboard body as a real error', () => {
+    for (const bad of [null, undefined, 'login page', { message: 'oops' }, { ok: false }]) {
+      assert.throws(
+        () => api.normalizeDashboardPayload(bad),
+        (error) =>
+          error instanceof api.ApiError &&
+          error.message.includes('unexpected response') &&
+          !error.message.includes('Cannot reach'),
+      );
+    }
+  });
 
   // A dashboard 500 must read as plain English — never a raw status or any
   // server-side detail — so the screen can offer a retry with useful copy.
@@ -542,6 +796,167 @@ async function run() {
         });
       } catch (error) {
         check('adminRevenue 403 surfaces as ApiError with field role', () => {
+          assert.ok(error instanceof api.ApiError);
+          assert.equal(error.status, 403);
+          assert.equal(error.field, 'role');
+        });
+      }
+    },
+  );
+
+  // --- admin console (overview, users, records) ----------------------------
+  await withFetch(
+    async (url, init) => {
+      assert.ok(String(url).endsWith('/api/admin/overview'));
+      assert.equal(init.method, 'GET');
+      assert.equal(init.headers.Authorization, 'Bearer sf_admin_token');
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          users: { total: 3, admins: 1, cargoOwners: 1, truckOwners: 1, active: 3, suspended: 0 },
+          cargo: { total: 3, byStatus: { posted: 3 } },
+          trucks: { total: 1, byStatus: { available: 1 } },
+          bookings: { total: 3, byStatus: { pending: 3 } },
+          shipments: { total: 1, byStatus: { booked: 1 } },
+          revenue: { liveCommission: 240, paidCommission: 160, totalRecords: 2 },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    },
+    async () => {
+      const payload = await api.api.adminOverview('sf_admin_token');
+      check('adminOverview attaches the bearer and parses the system counts', () => {
+        assert.equal(payload.users.total, 3);
+        assert.equal(payload.users.admins, 1);
+        assert.equal(payload.cargo.byStatus.posted, 3);
+        assert.equal(payload.revenue.liveCommission, 240);
+        assert.equal(payload.revenue.paidCommission, 160);
+      });
+    },
+  );
+
+  await withFetch(
+    async (url, init) => {
+      assert.ok(String(url).endsWith('/api/admin/users'));
+      assert.equal(init.headers.Authorization, 'Bearer sf_admin_token');
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          users: [
+            {
+              id: 'u1',
+              identifier: 'amina@co.tz',
+              name: 'Amina',
+              role: 'cargo_owner',
+              companyName: 'Acme Haulage',
+              status: 'active',
+              createdAt: 1791618027000,
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    },
+    async () => {
+      const payload = await api.api.adminUsers('sf_admin_token');
+      check('adminUsers lists every account with its role and status', () => {
+        assert.equal(payload.users.length, 1);
+        assert.equal(payload.users[0].role, 'cargo_owner');
+        assert.equal(payload.users[0].status, 'active');
+        assert.equal(payload.users[0].companyName, 'Acme Haulage');
+      });
+    },
+  );
+
+  await withFetch(
+    async (url, init) => {
+      assert.ok(String(url).endsWith('/api/admin/users/u2'));
+      assert.equal(init.method, 'PATCH');
+      assert.equal(init.headers.Authorization, 'Bearer sf_admin_token');
+      const body = JSON.parse(init.body);
+      assert.equal(body.role, 'truck_owner');
+      assert.equal(body.status, 'suspended');
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          user: {
+            id: 'u2',
+            identifier: 'juma@co.tz',
+            name: 'Juma',
+            role: 'truck_owner',
+            companyName: null,
+            status: 'suspended',
+            createdAt: null,
+          },
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    },
+    async () => {
+      const payload = await api.api.updateAdminUser('sf_admin_token', 'u2', {
+        role: 'truck_owner',
+        status: 'suspended',
+      });
+      check('updateAdminUser patches the account and returns the updated row', () => {
+        assert.equal(payload.user.role, 'truck_owner');
+        assert.equal(payload.user.status, 'suspended');
+      });
+    },
+  );
+
+  await withFetch(
+    async (url) => {
+      assert.ok(String(url).endsWith('/api/admin/cargo'));
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          cargo: [
+            {
+              id: 'c1',
+              reference: 'CG-ABC123',
+              cargoType: 'Cement',
+              status: 'posted',
+              pickupLocation: 'Dar es Salaam',
+              destination: 'Mwanza',
+              budget: 1000000,
+              currency: 'TZS',
+              owner: { id: 'u1', name: 'Amina', companyName: 'Acme Haulage' },
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    },
+    async () => {
+      const payload = await api.api.adminCargoList('sf_admin_token');
+      check('adminCargoList attaches the owner to every load', () => {
+        assert.equal(payload.cargo.length, 1);
+        assert.equal(payload.cargo[0].owner.companyName, 'Acme Haulage');
+        assert.equal(payload.cargo[0].budget, 1000000);
+      });
+    },
+  );
+
+  await withFetch(
+    async (url) => {
+      assert.ok(String(url).endsWith('/api/admin/overview'));
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          field: 'role',
+          message: 'Your account type does not allow that action.',
+        }),
+        { status: 403, headers: { 'Content-Type': 'application/json' } },
+      );
+    },
+    async () => {
+      try {
+        await api.api.adminOverview('sf_token');
+        check('admin console 403 surfaces as ApiError with field role', () => {
+          assert.fail('should have thrown');
+        });
+      } catch (error) {
+        check('admin console 403 surfaces as ApiError with field role', () => {
           assert.ok(error instanceof api.ApiError);
           assert.equal(error.status, 403);
           assert.equal(error.field, 'role');
@@ -1087,6 +1502,48 @@ async function run() {
       check('a login 401 does not notify subscribers', () => {
         assert.equal(fired, 0);
       });
+    },
+  );
+
+  // --- logout ------------------------------------------------------------
+  await withFetch(
+    async (url, init) => {
+      assert.ok(String(url).endsWith('/api/auth/logout'));
+      assert.equal(init.method, 'POST');
+      // The token is revoked server-side, so the bearer must be sent.
+      assert.equal(init.headers.Authorization, 'Bearer sf_token');
+      return new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    },
+    async () => {
+      const result = await api.api.logout('sf_token');
+      check('logout posts the bearer token and returns ok', () => {
+        assert.equal(result.ok, true);
+      });
+    },
+  );
+
+  // An unreachable server must reject — never hang forever — so the sign-out
+  // flow can clear the local session first and treat this call as best effort.
+  await withFetch(
+    async () => {
+      throw new TypeError('Network request failed');
+    },
+    async () => {
+      try {
+        await api.api.logout('sf_token');
+        check('an unreachable logout rejects as a network ApiError', () => {
+          assert.fail('should have thrown');
+        });
+      } catch (error) {
+        check('an unreachable logout rejects as a network ApiError', () => {
+          assert.ok(error instanceof api.ApiError);
+          assert.equal(error.kind, 'network');
+          assert.equal(error.status, 0);
+        });
+      }
     },
   );
 

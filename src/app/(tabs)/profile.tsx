@@ -1,6 +1,6 @@
 import { router, type Href } from 'expo-router';
 import { useState } from 'react';
-import { Alert, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Alert, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 
 import { Button, Card, Icon, Screen, type IconName } from '@/components/ui';
 import { Radii, Spacing } from '@/constants/theme';
@@ -14,6 +14,10 @@ const themeModes: { value: ThemeMode; label: string; icon: IconName }[] = [
   { value: 'light', label: 'Light', icon: 'eye' },
   { value: 'dark', label: 'Dark', icon: 'eye' },
 ];
+
+const SIGN_OUT_TITLE = 'Log out?';
+const SIGN_OUT_MESSAGE =
+  'You will need to sign in again to access your workspace.';
 
 export default function ProfileScreen() {
   const theme = useTheme();
@@ -38,17 +42,31 @@ export default function ProfileScreen() {
           { label: 'Matches', hint: 'Trucks for your loads', icon: 'swap', route: '/matches' },
         ];
 
+  const startSignOut = () => {
+    // Ignore repeat taps while a logout is already running (the Button also
+    // disables itself via `loading`, this covers the confirmation path).
+    if (signingOut) return;
+    setSigningOut(true);
+    void signOut().finally(() => setSigningOut(false));
+  };
+
   const confirmSignOut = () => {
-    Alert.alert('Log out?', 'You will need to sign in again to access your workspace.', [
+    if (signingOut) return;
+
+    // react-native-web ships Alert.alert as an empty stub, so on web the
+    // platform alert would silently swallow this tap. Web uses the browser's
+    // own confirmation dialog (Cancel / OK) with the same copy; native keeps
+    // the platform alert from the original design.
+    if (Platform.OS === 'web') {
+      if (window.confirm(`${SIGN_OUT_TITLE} ${SIGN_OUT_MESSAGE}`)) {
+        startSignOut();
+      }
+      return;
+    }
+
+    Alert.alert(SIGN_OUT_TITLE, SIGN_OUT_MESSAGE, [
       { text: 'Cancel', style: 'cancel' },
-      {
-        text: 'Log out',
-        style: 'destructive',
-        onPress: () => {
-          setSigningOut(true);
-          void signOut().finally(() => setSigningOut(false));
-        },
-      },
+      { text: 'Log out', style: 'destructive', onPress: startSignOut },
     ]);
   };
 

@@ -9,7 +9,7 @@
  * by derivation rather than by resetting state.
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 import { useAuth } from '@/hooks/use-auth';
 import { api, ApiError, type RevenuePayload } from '@/lib/api';
@@ -35,15 +35,32 @@ export function useRevenue(): RevenueState {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  /** Newest load wins: a slow older response is dropped, not applied late. */
+  const sequenceRef = useRef(0);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const isActive = useCallback(
+    (sequence: number) => mountedRef.current && sequence === sequenceRef.current,
+    [],
+  );
+
   useEffect(() => {
     if (status !== 'authenticated' || !isAdmin) return;
 
+    const sequence = ++sequenceRef.current;
     let cancelled = false;
 
     (async () => {
       const session = await readSession().catch(() => null);
-      if (cancelled || !session?.token) {
-        if (!cancelled) setLoading(false);
+      if (cancelled || !isActive(sequence) || !session?.token) {
+        if (!cancelled && isActive(sequence)) setLoading(false);
         return;
       }
 
@@ -52,34 +69,37 @@ export function useRevenue(): RevenueState {
 
       try {
         const payload = await api.adminRevenue(session.token);
-        if (!cancelled) setData(payload);
+        if (isActive(sequence)) setData(payload);
       } catch (e) {
-        if (!cancelled) setError(e instanceof ApiError ? e.message : LOAD_ERROR);
+        if (isActive(sequence)) setError(e instanceof ApiError ? e.message : LOAD_ERROR);
       } finally {
-        if (!cancelled) setLoading(false);
+        if (isActive(sequence)) setLoading(false);
       }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [status, isAdmin]);
+  }, [status, isAdmin, isActive]);
 
   const reload = useCallback(async () => {
+    const sequence = ++sequenceRef.current;
     const session = await readSession().catch(() => null);
-    if (!session?.token) return;
+    if (!session?.token || !isActive(sequence)) return;
 
     setRefreshing(true);
     setError(null);
 
     try {
-      setData(await api.adminRevenue(session.token));
+      const payload = await api.adminRevenue(session.token);
+      if (isActive(sequence)) setData(payload);
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : LOAD_ERROR);
+      // Keep the last good totals on screen; the banner covers the failure.
+      if (isActive(sequence)) setError(e instanceof ApiError ? e.message : LOAD_ERROR);
     } finally {
-      setRefreshing(false);
+      if (isActive(sequence)) setRefreshing(false);
     }
-  }, []);
+  }, [isActive]);
 
   // Derive the non-admin / signed-out views instead of mutating state: the
   // (tabs) route unmounts on sign-out, so stale totals can never linger.

@@ -129,6 +129,17 @@ class AuthController extends Controller
             return $this->fieldError('password', 'Incorrect password. Try again', 401);
         }
 
+        // Suspension is enforced server-side (users.status, supabase_admin.sql):
+        // correct credentials are not enough while an account is suspended.
+        // Absent column (migration not applied) reads as active.
+        if ((string) ($user['status'] ?? 'active') === 'suspended') {
+            return response()->json([
+                'ok' => false,
+                'field' => 'form',
+                'message' => 'This account has been suspended. Please contact the platform administrator.',
+            ], 403);
+        }
+
         return response()->json([
             'ok' => true,
             'user' => $this->presentUser($user),

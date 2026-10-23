@@ -19,16 +19,26 @@ type TabItem = { name: string; href: Href; label: string; icon: IconName };
 export default function AppTabs() {
   const { user } = useAuth();
   const isTruckOwner = user?.role === 'truck_owner';
+  const isAdmin = user?.role === 'admin';
 
-  const tabs: TabItem[] = [
-    { name: 'index', href: '/', label: 'Home', icon: 'grid' },
-    { name: 'shipments', href: '/shipments', label: 'Shipments', icon: 'box' },
-    { name: 'matches', href: '/matches', label: 'Matches', icon: 'swap' },
-    isTruckOwner
-      ? { name: 'trucks', href: '/trucks', label: 'Fleet', icon: 'truck' }
-      : { name: 'cargo', href: '/cargo', label: 'Cargo', icon: 'box' },
-    { name: 'profile', href: '/profile', label: 'Profile', icon: 'person' },
-  ];
+  // Admins only see their system dashboard; the cargo/truck owner workspaces
+  // belong to those roles (the backend also rejects cross-role access).
+  const tabs: TabItem[] = isAdmin
+    ? [
+        { name: 'admin', href: '/admin', label: 'Admin', icon: 'grid' },
+        { name: 'profile', href: '/profile', label: 'Profile', icon: 'person' },
+      ]
+    : [
+        { name: 'index', href: '/', label: 'Home', icon: 'grid' },
+        { name: 'shipments', href: '/shipments', label: 'Shipments', icon: 'box' },
+        { name: 'matches', href: '/matches', label: 'Matches', icon: 'swap' },
+        { name: 'marketplace', href: '/marketplace', label: 'Market', icon: 'grid' },
+        { name: 'bookings', href: '/bookings', label: 'Bookings', icon: 'checkSeal' },
+        isTruckOwner
+          ? { name: 'trucks', href: '/trucks', label: 'Fleet', icon: 'truck' }
+          : { name: 'cargo', href: '/cargo', label: 'Cargo', icon: 'box' },
+        { name: 'profile', href: '/profile', label: 'Profile', icon: 'person' },
+      ];
 
   return (
     <Tabs style={styles.tabs}>

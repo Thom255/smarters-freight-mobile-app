@@ -13,7 +13,7 @@ import { Button, Card, Icon, Input, Screen } from '@/components/ui';
 import { Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/use-auth';
 import { useTheme } from '@/hooks/use-theme';
-import type { AuthField, UserRole } from '@/lib/auth-core';
+import { dashboardPathForRole, type AuthField, type UserRole } from '@/lib/auth-core';
 
 type FormErrors = Partial<Record<AuthField, string>>;
 
@@ -57,8 +57,9 @@ export default function RegisterScreen() {
       return;
     }
 
-    // Session is already active — replace so Back never returns here.
-    router.replace('/');
+    // Session is already active — replace so Back never returns here. The
+    // landing route comes from the server-verified role, same as sign-in.
+    router.replace(dashboardPathForRole(result.user.role));
   };
 
   return (
@@ -229,7 +230,7 @@ export default function RegisterScreen() {
               Already have an account?{' '}
             </Text>
             <Text style={[theme.typography.bodyMedium, { color: theme.accent }]}>
-              Sign in
+              Log in
             </Text>
           </Pressable>
         </View>

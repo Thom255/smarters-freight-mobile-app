@@ -15,6 +15,7 @@ import {
   SkeletonList,
 } from '@/components/ui';
 import { Spacing } from '@/constants/theme';
+import { useAuth } from '@/hooks/use-auth';
 import { useTheme } from '@/hooks/use-theme';
 import { useCargo, useCreateCargo, useUpdateCargo } from '@/hooks/use-cargo';
 import type { ApiCargo } from '@/lib/api';
@@ -36,12 +37,19 @@ const STATUS_FILTERS = CARGO_STATUSES.map((value) => ({
 
 export default function CargoScreen() {
   const theme = useTheme();
+  const { user } = useAuth();
   const { cargo, loading, refreshing, error, reload } = useCargo();
   const { updateCargo } = useUpdateCargo();
   const [composerOpen, setComposerOpen] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [status, setStatus] = useState<(typeof STATUS_FILTERS)[number]['value'] | 'all'>('all');
+
+  // Loads belong to cargo owners (admins may also post — the API's auth.role
+  // middleware lets admin past every role rule). A truck owner arriving via a
+  // deep link sees this notice instead of an empty workspace whose "Post
+  // cargo" button would only ever 403.
+  const canPostCargo = user?.role === 'cargo_owner' || user?.role === 'admin';
 
   const filtered = useMemo(
     () =>
@@ -105,16 +113,39 @@ export default function CargoScreen() {
       <Header title="My cargo" subtitle={subtitle} back={false} />
 
       <View style={styles.body}>
-        {actionError ? (
-          <Text style={[theme.typography.caption, { color: theme.danger }]}>{actionError}</Text>
-        ) : null}
-        <Button
-          onPress={() => setComposerOpen(true)}
-          iconLeft={<Icon name="plus" size={18} color={theme.onPrimary} />}>
-          Post cargo
-        </Button>
+        {!canPostCargo ? (
+          <Card>
+            <View style={styles.emptyState}>
+              <View style={[styles.emptyIcon, { backgroundColor: theme.infoSubtle }]}>
+                <Icon name="info" size={26} color={theme.info} />
+              </View>
+              <Text style={[theme.typography.subheading, { color: theme.text }]}>
+                Cargo owners only
+              </Text>
+              <Text
+                style={[theme.typography.caption, styles.emptyText, { color: theme.textSecondary }]}>
+                The cargo workspace is limited to accounts that post loads. Find open loads from
+                the Marketplace tab instead.
+              </Text>
+              <Button fullWidth={false} onPress={() => router.push('/')}>
+                Go to home
+              </Button>
+            </View>
+          </Card>
+        ) : (
+          <>
+            {actionError ? (
+              <Text style={[theme.typography.caption, { color: theme.danger }]}>{actionError}</Text>
+            ) : null}
+            <Button
+              onPress={() => setComposerOpen(true)}
+              iconLeft={<Icon name="plus" size={18} color={theme.onPrimary} />}>
+              Post cargo
+            </Button>
+          </>
+        )}
 
-        {!loading && totalCount > 0 ? (
+        {!canPostCargo ? null : !loading && totalCount > 0 ? (
           <ListControls
             query={query}
             onQueryChange={setQuery}
@@ -126,7 +157,7 @@ export default function CargoScreen() {
           />
         ) : null}
 
-        {error && !cargo ? (
+        {!canPostCargo ? null : error && !cargo ? (
           <Card>
             <View style={styles.emptyState}>
               <View style={[styles.emptyIcon, { backgroundColor: theme.dangerSubtle }]}>

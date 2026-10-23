@@ -1,4 +1,4 @@
-import { router, type Href } from 'expo-router';
+import { Redirect, router, type Href } from 'expo-router';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import {
@@ -34,21 +34,25 @@ export default function DashboardScreen() {
   const role = user?.role ?? 'cargo_owner';
   const isTruckOwner = role === 'truck_owner';
 
+  // Admins have their own system dashboard. This also covers reopening the
+  // app on "/" or deep-linking there, not just the post-login redirect.
+  if (role === 'admin') return <Redirect href="/admin" />;
+
   const displayName = user?.name?.split(' ')[0] ?? 'SMARTERS FREIGHT';
   const subtitle = user?.name ? `${roleLabel(role)} · ${user.identifier}` : 'Signed in';
 
-  const roleActions: { label: string; icon: IconName; route: string }[] = isTruckOwner
+  const roleActions: { label: string; icon: IconName; href: Href }[] = isTruckOwner
     ? [
-        { label: 'Add truck', icon: 'truck', route: '/trucks' },
-        { label: 'Find loads', icon: 'swap', route: '/matches' },
+        { label: 'Add truck', icon: 'truck', href: { pathname: '/trucks', params: { add: '1' } } },
+        { label: 'Find loads', icon: 'swap', href: '/matches' },
       ]
     : [
-        { label: 'Post cargo', icon: 'box', route: '/cargo' },
-        { label: 'Find trucks', icon: 'swap', route: '/matches' },
+        { label: 'Post cargo', icon: 'box', href: '/cargo' },
+        { label: 'Find trucks', icon: 'swap', href: '/matches' },
       ];
 
-  const quickActions: { label: string; icon: IconName; route: string }[] = [
-    { label: 'New shipment', icon: 'plus', route: '/shipments/new' },
+  const quickActions: { label: string; icon: IconName; href: Href }[] = [
+    { label: 'New shipment', icon: 'plus', href: '/shipments/new' },
     ...roleActions,
   ];
 
@@ -129,7 +133,7 @@ export default function DashboardScreen() {
               </Button>
             </View>
           </Card>
-        ) : loading && !data ? (
+        ) : (loading || refreshing) && !data ? (
           <SkeletonList count={4} />
         ) : (
           <>
@@ -163,27 +167,27 @@ export default function DashboardScreen() {
 
             <FadeInView index={0}>
               <View style={styles.quickActions}>
-                {quickActions.map((action) => (
-                  <Pressable
-                    key={action.label}
-                    onPress={() => router.push(action.route as Href)}
-                    accessibilityRole="button"
-                    style={({ pressed }) => [
-                      styles.quickAction,
-                      {
-                        backgroundColor: theme.backgroundElement,
-                        borderColor: theme.border,
-                      },
-                      pressed && styles.pressed,
-                    ]}>
-                    <View style={[styles.roundIcon, { backgroundColor: theme.primarySubtle }]}>
-                      <Icon name={action.icon} size={18} color={theme.primary} />
-                    </View>
-                    <Text style={[theme.typography.bodyMedium, { color: theme.text }]}>
-                      {action.label}
-                    </Text>
-                  </Pressable>
-                ))}
+            {quickActions.map((action) => (
+              <Pressable
+                key={action.label}
+                onPress={() => router.push(action.href)}
+                accessibilityRole="button"
+                style={({ pressed }) => [
+                  styles.quickAction,
+                  {
+                    backgroundColor: theme.backgroundElement,
+                    borderColor: theme.border,
+                  },
+                  pressed && styles.pressed,
+                ]}>
+                <View style={[styles.roundIcon, { backgroundColor: theme.primarySubtle }]}>
+                  <Icon name={action.icon} size={18} color={theme.primary} />
+                </View>
+                <Text style={[theme.typography.bodyMedium, { color: theme.text }]}>
+                  {action.label}
+                </Text>
+              </Pressable>
+            ))}
               </View>
             </FadeInView>
 

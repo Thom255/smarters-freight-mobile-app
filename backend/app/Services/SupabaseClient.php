@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Exceptions\DataStoreUnavailable;
 use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Client\Pool;
+use Illuminate\Http\Client\RequestException;
 use Illuminate\Http\Client\Response;
 use Illuminate\Support\Facades\Http;
 
@@ -275,6 +276,15 @@ class SupabaseClient
             ], fn ($value) => $value !== null));
         } catch (ConnectionException $e) {
             throw new DataStoreUnavailable('Cannot reach Supabase REST API: '.$e->getMessage(), 503, $e);
+        } catch (RequestException $e) {
+            // The retry() helper above turns any non-2xx response into a
+            // RequestException before it can be inspected, so `failed()` is
+            // never reached for a read that the server answered with 4xx/5xx.
+            // Unwrap it back into the DataStoreUnavailable the rest of the
+            // app expects — otherwise every PostgREST error (missing column,
+            // missing table) surfaced as an unhandled 500 instead of the
+            // mapped, actionable one.
+            throw $this->toException($table, $e->response);
         }
 
         if ($pending->failed()) {

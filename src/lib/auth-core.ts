@@ -11,6 +11,12 @@
 
 export type UserRole = 'truck_owner' | 'cargo_owner' | 'admin';
 
+/** Screens whose access is decided by the server-verified account role. */
+export type RoleArea = 'admin' | 'cargo' | 'trucks';
+
+/** The home route each role lands on after sign-in / session restore. */
+export type DashboardPath = '/' | '/admin';
+
 export type User = {
   id: string;
   identifier: string;
@@ -61,6 +67,102 @@ export type ResetPasswordInput = {
 /** Emails and phone numbers are matched case-insensitively and trimmed. */
 export function normalizeIdentifier(value: string): string {
   return value.trim().toLowerCase();
+}
+
+/**
+ * Coerces a persisted role to a known value.
+ *
+ * Storage is client-side, so a tampered/corrupt session must not be able to
+ * route the app to the admin area. This only affects navigation; every admin
+ * API is still enforced by the backend's `auth.role:admin` middleware.
+ */
+export function normalizeRole(value: unknown): UserRole {
+  return value === 'admin' || value === 'truck_owner' || value === 'cargo_owner'
+    ? value
+    : 'cargo_owner';
+}
+
+/**
+ * Role-based landing route. Admins get the system dashboard; cargo and truck
+ * owners share the role-aware workspace dashboard.
+ */
+export function dashboardPathForRole(role: UserRole | null | undefined): DashboardPath {
+  return role === 'admin' ? '/admin' : '/';
+}
+
+/** The persisted session shape written by src/lib/auth.ts. */
+export type StoredSession = { user: User; token: string; issuedAt: number };
+
+/**
+ * Validates and normalizes a raw persisted session (SecureStore/localStorage
+ * string). Kept pure so session restoration — including role preservation
+ * across an app restart — is unit-testable outside React Native.
+ *
+ * Returns null ("no session") for anything unusable: corrupt JSON, a missing
+ * user id or token, or an account whose role field is absent/corrupted. The
+ * role is run through normalizeRole, so a tampered session can at most route
+ * the app to the least-privileged dashboard; every admin API is still gated
+ * server-side by `auth.role:admin` regardless of what this returns.
+ */
+export function parseSession(raw: string | null | undefined): StoredSession | null {
+  if (typeof raw !== 'string' || raw.trim() === '') return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+
+  if (parsed === null || typeof parsed !== 'object') return null;
+
+  const session = parsed as {
+    user?: { id?: unknown; role?: unknown; companyName?: unknown; name?: unknown; identifier?: unknown; createdAt?: unknown };
+    token?: unknown;
+    issuedAt?: unknown;
+  };
+
+  if (!session.user || typeof session.user.id !== 'string' || session.user.id === '') {
+    return null;
+  }
+
+  if (typeof session.token !== 'string' || session.token === '') {
+    return null;
+  }
+
+  return {
+    user: {
+      id: session.user.id,
+      identifier: typeof session.user.identifier === 'string' ? session.user.identifier : '',
+      name: typeof session.user.name === 'string' ? session.user.name : null,
+      // Sessions written before roles existed (or tampered with) fall back
+      // to the least-privileged role — never to admin.
+      role: normalizeRole(session.user.role),
+      companyName: typeof session.user.companyName === 'string' ? session.user.companyName : null,
+      createdAt: typeof session.user.createdAt === 'number' ? session.user.createdAt : null,
+    },
+    token: session.token,
+    issuedAt: typeof session.issuedAt === 'number' ? session.issuedAt : 0,
+  };
+}
+
+/**
+ * Whether a role may open one of the role-owned dashboards. Admin is
+ * intentionally excluded from the cargo-owner and truck-owner workspaces:
+ * admins manage those records through the admin console instead.
+ */
+export function roleCanAccessArea(
+  role: UserRole | null | undefined,
+  area: RoleArea,
+): boolean {
+  switch (area) {
+    case 'admin':
+      return role === 'admin';
+    case 'cargo':
+      return role === 'cargo_owner';
+    case 'trucks':
+      return role === 'truck_owner';
+  }
 }
 
 export function validateIdentifier(value: string): string | null {

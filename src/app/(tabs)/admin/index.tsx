@@ -1,6 +1,6 @@
 import { router } from 'expo-router';
 import type { ReactNode } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { Pressable, StyleSheet, Text, View } from 'react-native';
 
 import {
   Badge,
@@ -15,10 +15,11 @@ import {
   type IconName,
 } from '@/components/ui';
 import { Spacing } from '@/constants/theme';
+import { useAdminOverview } from '@/hooks/use-admin-overview';
 import { useAuth } from '@/hooks/use-auth';
 import { useRevenue } from '@/hooks/use-revenue';
 import { useTheme } from '@/hooks/use-theme';
-import type { ApiCommission, CommissionStatus, RevenuePayload } from '@/lib/api';
+import type { AdminOverviewPayload, ApiCommission, CommissionStatus, RevenuePayload } from '@/lib/api';
 import { formatDate, formatMoney, titleCaseStatus } from '@/lib/marketplace';
 
 const COMMISSION_STATUS_TONE: Record<CommissionStatus, BadgeTone> = {
@@ -30,26 +31,28 @@ const COMMISSION_STATUS_TONE: Record<CommissionStatus, BadgeTone> = {
 };
 
 /**
- * Admin revenue screen — GET /api/admin/revenue.
+ * Admin system dashboard — GET /api/admin/overview and GET /api/admin/revenue.
  *
- * Every figure on this screen comes from the backend's commission ledger:
- * the platform's 8% of each agreed transportation price, split into the
- * pending / earned / paid buckets (mutually exclusive, so nothing is counted
- * twice) with cancelled and refunded records kept visible but never added to
- * revenue. Settlement evidence (`paymentReference`) is display-only here —
- * the app cannot mark money as received.
+ * Every figure comes from server-computed totals: users by role/status,
+ * cargo/trucks/bookings/shipments by status, and the platform's 8% commission
+ * ledger (pending/earned/paid/cancelled/refunded). A role guard and the
+ * backend `auth.role:admin` middleware ensure only admins reach this screen;
+ * non-admin accounts are redirected by the admin layout and tabs.
  */
 export default function RevenueScreen() {
   const theme = useTheme();
   const { user, status: authStatus } = useAuth();
   const { data, loading, refreshing, error, reload } = useRevenue();
+  const overview = useAdminOverview();
 
   const hydrating = authStatus === 'loading';
   const isAdmin = user?.role === 'admin';
 
   const subtitle = data
     ? `${data.commissionRate}% commission · ${data.totals.completedShipments} shipments completed`
-    : 'Platform commission';
+    : overview.data
+      ? `${overview.data.users.total} users · ${overview.data.cargo.total} cargo · ${overview.data.trucks.total} trucks`
+      : 'System overview';
 
   let body: ReactNode;
 
@@ -130,16 +133,26 @@ export default function RevenueScreen() {
     );
   }
 
+  const isRefreshing = refreshing || overview.refreshing;
+
   return (
     <Screen
       scroll
       tabBar
-      refreshing={refreshing}
+      refreshing={isRefreshing}
       onRefresh={() => {
-        if (isAdmin) void reload();
+        if (!isAdmin) return;
+        void reload();
+        void overview.reload();
       }}
       contentStyle={styles.content}>
-      <Header title="Revenue" back={false} subtitle={subtitle} />
+      <Header title="Admin dashboard" back={false} subtitle={subtitle} />
+      {isAdmin ? (
+        <>
+          <OverviewSection state={overview} />
+          <ManageCard />
+        </>
+      ) : null}
       {body}
     </Screen>
   );
@@ -228,6 +241,111 @@ function RevenueBody({ data }: { data: RevenuePayload }) {
         ))
       )}
     </>
+  );
+}
+
+function OverviewSection({
+  state,
+}: {
+  state: {
+    data: AdminOverviewPayload | null;
+    loading: boolean;
+    error: string | null;
+    reload: () => Promise<void>;
+  };
+}) {
+  const theme = useTheme();
+  const { data, loading, error, reload } = state;
+
+  if (loading && !data) {
+    return <SkeletonList count={1} />;
+  }
+
+  if (error && !data) {
+    return (
+      <Card>
+        <View style={styles.row}>
+          <View style={[styles.roundIcon, { backgroundColor: theme.dangerSubtle }]}>
+            <Icon name="alert" size={18} color={theme.danger} />
+          </View>
+          <View style={styles.flex}>
+            <Text style={[theme.typography.bodyMedium, { color: theme.text }]}>
+              Couldn&apos;t load overview
+            </Text>
+            <Text style={[theme.typography.caption, { color: theme.textSecondary }]}>{error}</Text>
+          </View>
+        </View>
+      </Card>
+    );
+  }
+
+  if (!data) return null;
+
+  const u = data.users;
+  const tiles = [
+    { key: 'users', label: 'Users', value: String(u.total), icon: 'person' as const },
+    { key: 'cargo', label: 'Cargo owners', value: String(u.cargoOwners), icon: 'box' as const },
+    { key: 'truck', label: 'Truck owners', value: String(u.truckOwners), icon: 'truck' as const },
+    { key: 'admins', label: 'Admins', value: String(u.admins), icon: 'flag' as const },
+    { key: 'loads', label: 'Cargo listings', value: String(data.cargo.total), icon: 'warehouse' as const },
+    { key: 'trucks', label: 'Trucks', value: String(data.trucks.total), icon: 'truck' as const },
+    { key: 'bookings', label: 'Bookings', value: String(data.bookings.total), icon: 'checkSeal' as const },
+    { key: 'shipments', label: 'Shipments', value: String(data.shipments.total), icon: 'route' as const },
+  ];
+
+  return (
+    <>
+      {/* A failed refresh keeps the last good counts on screen; only this
+          compact warning + Retry appear above them. */}
+      {error ? (
+        <Card>
+          <View style={styles.row}>
+            <View style={[styles.roundIcon, { backgroundColor: theme.dangerSubtle }]}>
+              <Icon name="alert" size={18} color={theme.danger} />
+            </View>
+            <View style={styles.flex}>
+              <Text style={[theme.typography.bodyMedium, { color: theme.text }]}>
+                Couldn&apos;t refresh overview
+              </Text>
+              <Text style={[theme.typography.caption, { color: theme.textSecondary }]}>{error}</Text>
+            </View>
+            <Button size="sm" variant="ghost" fullWidth={false} onPress={() => void reload()}>
+              Retry
+            </Button>
+          </View>
+        </Card>
+      ) : null}
+
+      <SectionHeader title="System overview" action={`${u.active} active · ${u.suspended} suspended`} />
+      <FadeInView index={0}>
+        <View style={styles.grid}>
+          {tiles.map((tile) => (
+            <StatTile key={tile.key} icon={tile.icon} label={tile.label} value={tile.value} />
+          ))}
+        </View>
+      </FadeInView>
+    </>
+  );
+}
+
+function ManageCard() {
+  const theme = useTheme();
+
+  return (
+    <FadeInView index={0}>
+      <Pressable onPress={() => router.push('/admin/manage')} style={({ pressed }) => [styles.manageCard, pressed && styles.pressed]}>
+        <View style={[styles.roundIcon, { backgroundColor: theme.primarySubtle }]}>
+          <Icon name="grid" size={18} color={theme.primary} />
+        </View>
+        <View style={styles.flex}>
+          <Text style={[theme.typography.bodyMedium, { color: theme.text }]}>System records</Text>
+          <Text style={[theme.typography.caption, { color: theme.textSecondary }]}>
+            Browse every user, load, truck, booking and shipment — and manage account roles
+          </Text>
+        </View>
+        <Icon name="chevronRight" size={18} color={theme.textSecondary} />
+      </Pressable>
+    </FadeInView>
   );
 }
 
@@ -480,5 +598,18 @@ const styles = StyleSheet.create({
   centerText: {
     textAlign: 'center',
     marginBottom: Spacing.two,
+  },
+  manageCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: Spacing.three,
+    padding: Spacing.three,
+    borderRadius: 14,
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: 'rgba(15, 23, 42, 0.08)',
+  },
+  pressed: {
+    opacity: 0.7,
   },
 });

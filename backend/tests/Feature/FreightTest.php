@@ -28,6 +28,63 @@ class FreightTest extends ApiTestCase
             ->assertJsonPath('truck.verificationStatus', 'pending');
     }
 
+    public function test_a_created_truck_is_owned_by_the_session_user_and_appears_in_the_dashboard_fleet(): void
+    {
+        $owner = $this->seedUser(['role' => 'truck_owner']);
+        $other = $this->seedUser(['role' => 'truck_owner']);
+        $token = $this->tokenFor($owner['id']);
+        $otherToken = $this->tokenFor($other['id']);
+
+        $response = $this->withHeaders($this->bearer($token))->postJson('/api/trucks', [
+            'registrationNumber' => 'T OWNER1',
+            'truckType' => 'Flatbed',
+            'capacityTons' => 25,
+            'currentLocation' => 'Dar es Salaam',
+            'availabilityDate' => '2026-10-20',
+            'driverName' => 'Juma Ally',
+            'driverPhone' => '+255 712 000 000',
+            'ratePerTon' => 45000,
+            // A client must not be able to choose the owner.
+            'owner_id' => $other['id'],
+        ]);
+
+        $response->assertStatus(201)
+            ->assertJsonPath('ok', true)
+            ->assertJsonPath('truck.registrationNumber', 'T OWNER1')
+            ->assertJsonPath('truck.status', 'available');
+
+        $truckId = $response->json('truck.id');
+        $truck = $this->db->selectOne('trucks', ['id' => 'eq.'.$truckId]);
+
+        $this->assertNotNull($truck);
+        $this->assertSame($owner['id'], $truck['owner_id']);
+        $this->assertSame('Juma Ally', $truck['driver_name']);
+        $this->assertSame('+255 712 000 000', $truck['driver_phone']);
+        $this->assertEqualsWithDelta(45000, (float) $truck['rate_per_ton'], 0.01);
+        $this->assertSame('available', $truck['status']);
+
+        // The fleet listing and dashboard remain owner-scoped.
+        $this->withHeaders($this->bearer($token))
+            ->getJson('/api/trucks')
+            ->assertOk()
+            ->assertJsonCount(1, 'trucks')
+            ->assertJsonPath('trucks.0.id', $truckId);
+
+        $this->withHeaders($this->bearer($otherToken))
+            ->getJson('/api/trucks')
+            ->assertOk()
+            ->assertJsonCount(0, 'trucks');
+
+        $this->withHeaders($this->bearer($token))
+            ->getJson('/api/dashboard')
+            ->assertOk()
+            ->assertJsonPath('role', 'truck_owner')
+            ->assertJsonPath('fleet.total', 1)
+            ->assertJsonPath('fleet.available', 1)
+            ->assertJsonPath('marketplace.trucks', 1)
+            ->assertJsonPath('marketplace.availableTrucks', 1);
+    }
+
     public function test_registering_a_duplicate_plate_is_a_field_error(): void
     {
         $owner = $this->seedUser(['role' => 'truck_owner']);

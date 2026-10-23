@@ -12,12 +12,32 @@
 // Fallback only applies when EXPO_PUBLIC_API_URL is unset. It must point at
 // backend/ (port 8001) — port 8000 runs the separate SRS API, whose contract
 // this client does not speak.
-import type { UserRole } from './auth-core';
+// Extension kept explicit so Node (scripts/*.test.mjs) can execute this
+// module directly; Metro resolves it the same way (see shipment-form.ts).
+import { normalizeRole, type UserRole } from './auth-core.ts';
 
-const BASE_URL = (process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:8001').replace(
+const FALLBACK_BASE_URL = (process.env.EXPO_PUBLIC_API_URL ?? 'http://localhost:8001').replace(
   /\/+$/,
   '',
 );
+
+/**
+ * Device-specific origin, set once at startup (src/app/_layout.tsx) when
+ * EXPO_PUBLIC_API_URL is unset — it derives the right host for the current
+ * runtime (10.0.2.2 from the Android emulator, the Metro host's LAN IP on a
+ * physical phone, loopback on the same machine). When the env var IS set —
+ * the normal case — the resolver returns null and this never kicks in.
+ */
+let runtimeOrigin: string | null = null;
+
+/** Install the derived origin. Called once from the app root, before any request. */
+export function configureApiOrigin(origin: string | null): void {
+  if (origin) runtimeOrigin = origin.replace(/\/+$/, '');
+}
+
+function baseUrl(): string {
+  return runtimeOrigin ?? FALLBACK_BASE_URL;
+}
 
 /** Error body the backend returns for any failure: { ok:false, field, message }. */
 type ApiErrorShape = { ok?: false; field?: string; message?: string };
@@ -49,6 +69,26 @@ export class ApiError extends Error {
 
 const NETWORK_MESSAGE = 'Cannot reach the server. Check your connection and try again.';
 const TIMEOUT_MESSAGE = 'The server took too long to respond. Please try again.';
+const MALFORMED_MESSAGE = 'The server sent an unexpected response. Please try again.';
+
+/**
+ * Bounded backoff for transient *network* failures — connection refused,
+ * DNS, unreachable host (typically the backend is still starting up or just
+ * restarted). Deliberately NOT applied to timeouts (each attempt can already
+ * hold for 20s, so retrying them would stall the screen for a minute) and
+ * never to HTTP responses: a 401/403/404/5xx is answered by a live server
+ * and repeating it would just multiply bad traffic — 401/403 must fail fast
+ * so the session can be cleared.
+ */
+const TRANSIENT_RETRY_DELAYS_MS = [300, 900];
+
+function isTransientNetworkFailure(error: unknown): error is ApiError {
+  return error instanceof ApiError && error.kind === 'network';
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 /**
  * Fallback text when the backend sent no usable `message`. The server's own
@@ -121,9 +161,26 @@ type RequestOptions = {
   method?: 'GET' | 'POST' | 'PATCH' | 'DELETE';
   body?: unknown;
   token?: string | null;
+  /** Extra attempts after the first, only for transient network failures. */
+  retries?: number;
 };
 
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
+  const retries = options.retries ?? 0;
+
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await attemptRequest<T>(path, options);
+    } catch (error) {
+      if (!isTransientNetworkFailure(error) || attempt >= retries) {
+        throw error;
+      }
+      await delay(TRANSIENT_RETRY_DELAYS_MS[Math.min(attempt, TRANSIENT_RETRY_DELAYS_MS.length - 1)]);
+    }
+  }
+}
+
+async function attemptRequest<T>(path: string, options: RequestOptions): Promise<T> {
   const { method = 'GET', body, token } = options;
 
   let response: Response;
@@ -131,7 +188,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   const deadline = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
   try {
-    response = await fetch(`${BASE_URL}${path}`, {
+    response = await fetch(`${baseUrl()}${path}`, {
       method,
       headers: {
         Accept: 'application/json',
@@ -472,6 +529,92 @@ export type DashboardPayload = {
   alerts: DashboardAlert[];
 };
 
+function asObject(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function asNumber(value: unknown, fallback = 0): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+/**
+ * Validates and degrades a GET /api/dashboard body into a renderable payload.
+ *
+ * A 2xx that is not this endpoint's `{ ok:true, ... }` envelope is a REAL
+ * error (proxy page, HTML, truncated body) and is thrown as such — never
+ * silently rendered as an empty dashboard. But when the envelope is correct
+ * and individual sections are missing/unshaped (partial response, older
+ * backend), only those sections fall back to zeroed/empty values so one bad
+ * group cannot blank the whole screen.
+ */
+export function normalizeDashboardPayload(raw: unknown): DashboardPayload {
+  const root = asObject(raw);
+
+  if (root.ok !== true) {
+    throw new ApiError(MALFORMED_MESSAGE, 200, 'form', 'http');
+  }
+
+  const statsRaw = asObject(root.stats);
+  const booked = asNumber(statsRaw.booked);
+  const marketplaceRaw = asObject(root.marketplace);
+  const fleetRaw = asObject(root.fleet);
+  const loadsRaw = asObject(root.loads);
+  const bookingsRaw = asObject(root.bookings);
+  const activeShipment = root.activeShipment;
+
+  return {
+    ok: true,
+    role: typeof root.role === 'string' ? normalizeRole(root.role) : 'cargo_owner',
+    stats: {
+      shipments: asNumber(statsRaw.shipments),
+      booked,
+      inTransit: asNumber(statsRaw.inTransit),
+      delivered: asNumber(statsRaw.delivered),
+      cancelled: asNumber(statsRaw.cancelled),
+      orders: 'orders' in statsRaw ? asNumber(statsRaw.orders) : booked,
+    },
+    marketplace: {
+      trucks: asNumber(marketplaceRaw.trucks),
+      availableTrucks: asNumber(marketplaceRaw.availableTrucks),
+      cargo: asNumber(marketplaceRaw.cargo),
+      postedCargo: asNumber(marketplaceRaw.postedCargo),
+      matches: asNumber(marketplaceRaw.matches),
+    },
+    fleet: {
+      total: asNumber(fleetRaw.total),
+      available: asNumber(fleetRaw.available),
+      booked: asNumber(fleetRaw.booked),
+      inTransit: asNumber(fleetRaw.inTransit),
+      maintenance: asNumber(fleetRaw.maintenance),
+      inactive: asNumber(fleetRaw.inactive),
+    },
+    loads: {
+      total: asNumber(loadsRaw.total),
+      pending: asNumber(loadsRaw.pending),
+      confirmed: asNumber(loadsRaw.confirmed),
+      inTransit: asNumber(loadsRaw.inTransit),
+      completed: asNumber(loadsRaw.completed),
+      cancelled: asNumber(loadsRaw.cancelled),
+    },
+    bookings: { active: asNumber(bookingsRaw.active) },
+    activeShipment:
+      activeShipment !== null &&
+      typeof activeShipment === 'object' &&
+      !Array.isArray(activeShipment)
+        ? (activeShipment as DashboardPayload['activeShipment'])
+        : null,
+    upcomingDeliveries: asArray(root.upcomingDeliveries) as DashboardPayload['upcomingDeliveries'],
+    recentActivity: asArray(root.recentActivity) as DashboardPayload['recentActivity'],
+    alerts: asArray(root.alerts) as DashboardPayload['alerts'],
+  };
+}
+
 /** Commission ledger statuses (backend `commissions.status`). */
 export type CommissionStatus =
   | 'pending'
@@ -540,6 +683,65 @@ export type RevenuePayload = {
   commissions: ApiCommission[];
 };
 
+export type AdminAccountStatus = 'active' | 'suspended';
+
+export type AdminOwner = { id: string; name: string | null; companyName: string | null };
+
+export type AdminUser = {
+  id: string;
+  identifier: string;
+  name: string | null;
+  role: UserRole;
+  companyName: string | null;
+  status: AdminAccountStatus;
+  createdAt: number | null;
+};
+
+export type AdminOverviewCounts = { total: number; byStatus: Record<string, number> };
+
+export type AdminOverviewPayload = {
+  ok: true;
+  users: {
+    total: number;
+    admins: number;
+    cargoOwners: number;
+    truckOwners: number;
+    active: number;
+    suspended: number;
+  };
+  cargo: AdminOverviewCounts;
+  trucks: AdminOverviewCounts;
+  bookings: AdminOverviewCounts;
+  shipments: AdminOverviewCounts;
+  revenue: {
+    liveCommission: number;
+    paidCommission: number;
+    totalRecords: number;
+  };
+};
+
+export type AdminUserListPayload = { ok: true; users: AdminUser[] };
+
+export type AdminCargoRecord = ApiCargo & { owner: AdminOwner | null };
+
+export type AdminTruckRecord = ApiTruck & { owner: AdminOwner | null };
+
+export type AdminBookingRecord = ApiBooking;
+
+export type AdminShipmentRecord = {
+  id: string;
+  reference: string;
+  origin: string;
+  destination: string;
+  status: ApiShipment['status'];
+  notes: string | null;
+  cargoType: string | null;
+  weightTons: number | null;
+  pickupDate: number | null;
+  createdAt: number | null;
+  owner: AdminOwner | null;
+};
+
 // ---------------------------------------------------------------------------
 // Endpoints
 // ---------------------------------------------------------------------------
@@ -584,12 +786,54 @@ export const api = {
   },
 
   dashboard(token: string): Promise<DashboardPayload> {
-    return request('/api/dashboard', { token });
+    // Two bounded retries cover the backend-not-yet-listening window; every
+    // payload goes through normalizeDashboardPayload so a partial body
+    // degrades per section instead of blanking the screen.
+    return request('/api/dashboard', { token, retries: 2 }).then(
+      normalizeDashboardPayload,
+    );
   },
 
   /** Admin only — 8% commission totals, counts and ledger records. */
   adminRevenue(token: string): Promise<RevenuePayload> {
-    return request('/api/admin/revenue', { token });
+    return request('/api/admin/revenue', { token, retries: 2 });
+  },
+
+  // --- Admin console (SRS §2/§9) -------------------------------------------
+  adminOverview(token: string): Promise<AdminOverviewPayload> {
+    return request('/api/admin/overview', { token, retries: 2 });
+  },
+
+  adminUsers(token: string): Promise<AdminUserListPayload> {
+    return request('/api/admin/users', { token });
+  },
+
+  updateAdminUser(
+    token: string,
+    id: string,
+    input: { role?: UserRole; status?: AdminAccountStatus },
+  ): Promise<{ ok: true; user: AdminUser }> {
+    return request(`/api/admin/users/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: input,
+      token,
+    });
+  },
+
+  adminCargoList(token: string): Promise<{ ok: true; cargo: AdminCargoRecord[] }> {
+    return request('/api/admin/cargo', { token });
+  },
+
+  adminTrucksList(token: string): Promise<{ ok: true; trucks: AdminTruckRecord[] }> {
+    return request('/api/admin/trucks', { token });
+  },
+
+  adminBookingsList(token: string): Promise<{ ok: true; bookings: AdminBookingRecord[] }> {
+    return request('/api/admin/bookings', { token });
+  },
+
+  adminShipmentsList(token: string): Promise<{ ok: true; shipments: AdminShipmentRecord[] }> {
+    return request('/api/admin/shipments', { token });
   },
 
   shipments(token: string): Promise<{ ok: true; shipments: ApiShipment[] }> {

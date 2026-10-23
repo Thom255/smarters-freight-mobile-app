@@ -53,6 +53,15 @@ class AuthenticateApi
             return $this->unauthorized('Account no longer exists');
         }
 
+        // A suspended account's sessions are revoked the moment the admin
+        // suspends it (users.status, supabase_admin.sql; an absent column
+        // reads as active). Reported as 401 so the app treats the saved
+        // session as dead and returns to the sign-in screen, where the
+        // login attempt itself explains the suspension.
+        if ((string) ($user['status'] ?? 'active') === 'suspended') {
+            return $this->unauthorized('This account has been suspended. Please contact the platform administrator.');
+        }
+
         $request->attributes->set('auth_user', $user);
         $request->attributes->set('token_id', $token['id']);
 

@@ -1,6 +1,7 @@
 <?php
 
 use App\Http\Controllers\Api\AdminCommissionController;
+use App\Http\Controllers\Api\AdminConsoleController;
 use App\Http\Controllers\Api\AuthController;
 use App\Http\Controllers\Api\BookingController;
 use App\Http\Controllers\Api\CargoController;
@@ -88,5 +89,26 @@ Route::middleware(['auth.api', 'throttle:api'])->group(function () {
     Route::post('/admin/commissions/{id}/settle', [AdminCommissionController::class, 'settle'])
         ->middleware('auth.role:admin');
     Route::post('/admin/commissions/{id}/refund', [AdminCommissionController::class, 'refund'])
+        ->middleware('auth.role:admin');
+
+    // Admin console — system-wide reads + user account management (SRS
+    // §2/§9). Every route carries `auth.role:admin`, so a cargo/truck owner
+    // holding a valid token gets 403 from the middleware before the
+    // controller runs, and no customer-facing route can list other users'
+    // records at all. Registering these does not expose revenue writes —
+    // settlement stays on the commission routes above.
+    Route::get('/admin/overview', [AdminConsoleController::class, 'overview'])
+        ->middleware('auth.role:admin');
+    Route::get('/admin/users', [AdminConsoleController::class, 'users'])
+        ->middleware('auth.role:admin');
+    Route::patch('/admin/users/{id}', [AdminConsoleController::class, 'updateUser'])
+        ->middleware('auth.role:admin');
+    Route::get('/admin/cargo', [AdminConsoleController::class, 'cargo'])
+        ->middleware('auth.role:admin');
+    Route::get('/admin/trucks', [AdminConsoleController::class, 'trucks'])
+        ->middleware('auth.role:admin');
+    Route::get('/admin/bookings', [AdminConsoleController::class, 'bookings'])
+        ->middleware('auth.role:admin');
+    Route::get('/admin/shipments', [AdminConsoleController::class, 'shipments'])
         ->middleware('auth.role:admin');
 });

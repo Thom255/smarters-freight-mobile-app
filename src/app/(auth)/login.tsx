@@ -13,7 +13,7 @@ import { Button, Card, Icon, Input, Screen } from '@/components/ui';
 import { Spacing } from '@/constants/theme';
 import { useAuth } from '@/hooks/use-auth';
 import { useTheme } from '@/hooks/use-theme';
-import type { AuthField } from '@/lib/auth-core';
+import { dashboardPathForRole, type AuthField } from '@/lib/auth-core';
 
 type FormErrors = Partial<Record<AuthField, string>>;
 
@@ -40,7 +40,9 @@ export default function LoginScreen() {
       return;
     }
 
-    router.replace('/');
+    // The role came back from /api/auth/login (server-verified), not from
+    // anything the client supplied.
+    router.replace(dashboardPathForRole(result.user.role));
   };
 
   const clearError = (field: AuthField) =>
@@ -133,7 +135,7 @@ export default function LoginScreen() {
               Don&apos;t have an account?{' '}
             </Text>
             <Text style={[theme.typography.bodyMedium, { color: theme.accent }]}>
-              Create account
+              Register
             </Text>
             <Icon name="chevronRight" size={16} color={theme.accent} />
           </Pressable>

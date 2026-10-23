@@ -1,4 +1,4 @@
-import { router, type Href } from 'expo-router';
+import { router, useLocalSearchParams, type Href } from 'expo-router';
 import { useMemo, useState } from 'react';
 import { Alert, Modal, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 
@@ -15,6 +15,7 @@ import {
   SkeletonList,
 } from '@/components/ui';
 import { Spacing } from '@/constants/theme';
+import { useAuth } from '@/hooks/use-auth';
 import { useTheme } from '@/hooks/use-theme';
 import { useCreateTruck, useTrucks, useUpdateTruck } from '@/hooks/use-trucks';
 import type { ApiTruck } from '@/lib/api';
@@ -35,12 +36,30 @@ const STATUS_FILTERS = TRUCK_STATUSES.map((value) => ({
 
 export default function TrucksScreen() {
   const theme = useTheme();
+  const { user } = useAuth();
   const { trucks, loading, refreshing, error, reload } = useTrucks();
   const { updateTruck } = useUpdateTruck();
+  const params = useLocalSearchParams<{ add?: string }>();
   const [composerOpen, setComposerOpen] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [status, setStatus] = useState<(typeof STATUS_FILTERS)[number]['value'] | 'all'>('all');
+
+  // The fleet workspace belongs to truck owners (admins may also manage it �?"
+  // the API's auth.role middleware lets admin past every role rule). A cargo
+  // owner arriving via a deep link sees this notice instead of an empty
+  // workspace whose "Add a truck" button would only ever 403.
+  const canManageFleet = user?.role === 'truck_owner' || user?.role === 'admin';
+  const addTruckRequested = params.add === '1' && canManageFleet;
+  const composerVisible = composerOpen || addTruckRequested;
+
+  const closeComposer = () => {
+    setComposerOpen(false);
+    if (params.add !== undefined) {
+      router.setParams({ add: undefined });
+    }
+  };
 
   const filtered = useMemo(
     () =>
@@ -105,16 +124,46 @@ export default function TrucksScreen() {
       <Header title="My trucks" subtitle={subtitle} back={false} />
 
       <View style={styles.body}>
-        {actionError ? (
-          <Text style={[theme.typography.caption, { color: theme.danger }]}>{actionError}</Text>
-        ) : null}
-        <Button
-          onPress={() => setComposerOpen(true)}
-          iconLeft={<Icon name="plus" size={18} color={theme.onPrimary} />}>
-          Add a truck
-        </Button>
+        {!canManageFleet ? (
+          <Card>
+            <View style={styles.emptyState}>
+              <View style={[styles.emptyIcon, { backgroundColor: theme.infoSubtle }]}>
+                <Icon name="info" size={26} color={theme.info} />
+              </View>
+              <Text style={[theme.typography.subheading, { color: theme.text }]}>
+                Truck owners only
+              </Text>
+              <Text
+                style={[theme.typography.caption, styles.emptyText, { color: theme.textSecondary }]}>
+                The fleet workspace is limited to accounts that manage trucks. Post your loads
+                from the Cargo tab instead.
+              </Text>
+              <Button fullWidth={false} onPress={() => router.push('/')}>
+                Go to home
+              </Button>
+            </View>
+          </Card>
+        ) : (
+          <>
+            {actionError ? (
+              <Text style={[theme.typography.caption, { color: theme.danger }]}>{actionError}</Text>
+            ) : null}
+            {actionNotice ? (
+              <Text style={[theme.typography.caption, { color: theme.success }]}>{actionNotice}</Text>
+            ) : null}
+            <Button
+              onPress={() => {
+                setActionError(null);
+                setActionNotice(null);
+                setComposerOpen(true);
+              }}
+              iconLeft={<Icon name="plus" size={18} color={theme.onPrimary} />}>
+              Add a truck
+            </Button>
+          </>
+        )}
 
-        {!loading && totalCount > 0 ? (
+        {!canManageFleet ? null : !loading && totalCount > 0 ? (
           <ListControls
             query={query}
             onQueryChange={setQuery}
@@ -126,7 +175,7 @@ export default function TrucksScreen() {
           />
         ) : null}
 
-        {error && !trucks ? (
+        {!canManageFleet ? null : error && !trucks ? (
           <Card>
             <View style={styles.emptyState}>
               <View style={[styles.emptyIcon, { backgroundColor: theme.dangerSubtle }]}>
@@ -257,10 +306,12 @@ export default function TrucksScreen() {
       </View>
 
       <TruckComposer
-        visible={composerOpen}
-        onClose={() => setComposerOpen(false)}
+        visible={composerVisible}
+        onClose={closeComposer}
         onCreated={() => {
-          setComposerOpen(false);
+          closeComposer();
+          setActionError(null);
+          setActionNotice('Truck added to your fleet.');
           void reload();
         }}
       />

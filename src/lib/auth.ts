@@ -6,7 +6,7 @@
  * module only owns session persistence.
  */
 
-import { type User } from './auth-core';
+import { parseSession, type User } from './auth-core';
 import { getItem, removeItem, setItem } from './storage';
 
 const SESSION_KEY = 'smarters.session';
@@ -19,27 +19,9 @@ export type Session = {
 
 export async function readSession(): Promise<Session | null> {
   const raw = await getItem(SESSION_KEY);
-  if (!raw) return null;
-
-  try {
-    const parsed = JSON.parse(raw) as Session;
-    if (!parsed?.user?.id || typeof parsed.token !== 'string' || !parsed.token) {
-      return null;
-    }
-
-    // Sessions written before roles existed lack these fields — backfill them
-    // so older installs keep working.
-    return {
-      ...parsed,
-      user: {
-        ...parsed.user,
-        role: parsed.user.role ?? 'cargo_owner',
-        companyName: parsed.user.companyName ?? null,
-      },
-    };
-  } catch {
-    return null;
-  }
+  // Validation/normalization (role backfill, corrupt-payload rejection) is
+  // shared with the unit tests through auth-core's pure parseSession.
+  return parseSession(raw);
 }
 
 export async function writeSession(user: User, token: string): Promise<void> {

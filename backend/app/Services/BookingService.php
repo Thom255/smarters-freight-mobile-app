@@ -211,6 +211,18 @@ class BookingService
     }
 
     /**
+     * Same enrichment for the admin console, which sees bookings it is not a
+     * party to: no viewer, so `direction` stays the neutral presenter default.
+     *
+     * @param  array<int, array<string, mixed>>  $rows
+     * @return array<int, array<string, mixed>>
+     */
+    public function withRelationsForAdmin(array $rows): array
+    {
+        return $this->withRelations($rows, '');
+    }
+
+    /**
      * Attach the counterpart load/truck and the two parties to each booking.
      *
      * @param  array<int, array<string, mixed>>  $rows

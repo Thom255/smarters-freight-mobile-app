@@ -53,6 +53,34 @@ class AuthTest extends ApiTestCase
         $response->assertStatus(422)->assertJsonPath('field', 'name');
     }
 
+    public function test_register_cannot_grant_the_admin_role(): void
+    {
+        // Self-registration only ever creates cargo/truck owners — the admin
+        // role can only be assigned by an existing admin through
+        // PATCH /api/admin/users/{id}. Nobody may type themselves an admin.
+        $response = $this->postJson('/api/auth/register', [
+            'name' => 'Sneaky User',
+            'identifier' => 'sneaky@example.com',
+            'password' => 'secret123',
+            'role' => 'admin',
+        ]);
+
+        $response->assertStatus(422)
+            ->assertJsonPath('ok', false)
+            ->assertJsonPath('field', 'role')
+            ->assertJsonPath('message', 'Choose whether you own trucks or cargo');
+
+        $this->assertNull($this->db->selectOne('users', ['identifier' => 'eq.sneaky@example.com']));
+
+        // An unknown role value is rejected the same way.
+        $this->postJson('/api/auth/register', [
+            'name' => 'Sneaky Two',
+            'identifier' => 'sneaky2@example.com',
+            'password' => 'secret123',
+            'role' => 'superuser',
+        ])->assertStatus(422)->assertJsonPath('field', 'role');
+    }
+
     public function test_login_returns_a_token_for_valid_credentials(): void
     {
         $user = $this->seedUser(['identifier' => 'amina@example.com']);

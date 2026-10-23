@@ -41,7 +41,10 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "lint": "expo lint"
+    "lint": "expo lint",
+    "api": "php backend/artisan serve --host=0.0.0.0 --port=8001",
+    "test:api": "node ./scripts/api-connectivity.test.mjs",
+    "test:auth": "node ./scripts/auth-core.test.mjs"
   },
   "private": true
 }

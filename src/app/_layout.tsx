@@ -7,8 +7,15 @@ import { AnimatedSplashOverlay } from '@/components/animated-icon';
 import { AuthProvider, useAuth } from '@/hooks/use-auth';
 import { useTheme } from '@/hooks/use-theme';
 import { ThemeModeProvider, useThemeMode } from '@/hooks/use-theme-mode';
+import { configureApiOrigin } from '@/lib/api';
+import { deviceApiOrigin } from '@/lib/api-origin';
 
 SplashScreen.preventAutoHideAsync();
+
+// Resolve the backend origin once at startup — before any screen can fire a
+// request — so a device/emulator never falls back to localhost:8001 when
+// EXPO_PUBLIC_API_URL is unset. A null origin means .env already governs.
+configureApiOrigin(deviceApiOrigin());
 
 export default function RootLayout() {
   return (
